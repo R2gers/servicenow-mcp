@@ -22,8 +22,14 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 
+_env_loaded = False
+_env_error = None  # type: str | None
+
+
 def _load_env():
-    """Resolve and load .env: explicit --env-file flag first, then CWD/.env."""
+    """Resolve and load .env. Never crashes — sets _env_error if something is wrong."""
+    global _env_loaded, _env_error
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--env-file", default=None)
     args, _ = parser.parse_known_args()
@@ -32,11 +38,16 @@ def _load_env():
     env_file = args.env_file or cwd_env
 
     if not os.path.exists(env_file):
-        print(f"FATAL: No .env file found at {env_file}", file=sys.stderr)
-        print("Create a .env in your project folder with SERVICENOW_INSTANCE_URL, "
-              "SERVICENOW_USERNAME, SERVICENOW_PASSWORD (and optionally OAuth fields).",
-              file=sys.stderr)
-        sys.exit(1)
+        _env_error = (
+            f"No .env file found at {env_file}. "
+            f"Create a .env in your project folder with:\n"
+            f"  SERVICENOW_INSTANCE_URL=https://yourinstance.service-now.com\n"
+            f"  SERVICENOW_USERNAME=your_user\n"
+            f"  SERVICENOW_PASSWORD=your_pass"
+        )
+        print(f"servicenow-mcp: WARNING - {_env_error}", file=sys.stderr)
+        print("servicenow-mcp: Server will start but tools will return errors until .env is configured.", file=sys.stderr)
+        return
 
     load_dotenv(dotenv_path=env_file, override=True)
 
@@ -46,12 +57,22 @@ def _load_env():
     if "YOURINSTANCE" in placeholder.upper():
         missing.append("SERVICENOW_INSTANCE_URL (still has placeholder value)")
     if missing:
-        print(f"FATAL: Missing or invalid env vars in {env_file}: {', '.join(missing)}",
-              file=sys.stderr)
-        sys.exit(1)
+        _env_error = f"Missing or invalid env vars in {env_file}: {', '.join(missing)}"
+        print(f"servicenow-mcp: WARNING - {_env_error}", file=sys.stderr)
+        return
 
+    _env_loaded = True
     print(f"servicenow-mcp: loaded credentials from {env_file}", file=sys.stderr)
     print(f"servicenow-mcp: target instance -> {os.environ['SERVICENOW_INSTANCE_URL']}", file=sys.stderr)
+
+
+def _require_env():
+    """Call at the start of any tool handler. Raises if .env is not loaded."""
+    if not _env_loaded:
+        raise RuntimeError(
+            f"ServiceNow credentials not configured. {_env_error or ''}\n"
+            f"Create a .env file in your project folder and restart Claude Code."
+        )
 
 
 # ── Auth ────────────────────────────────────────────────────────────────────
@@ -383,6 +404,7 @@ def _guard_no_wipe(data: dict, context: str):
 
 
 def _dispatch(name: str, args: dict) -> Any:
+    _require_env()
     base = _base()
     h    = _headers()
 
