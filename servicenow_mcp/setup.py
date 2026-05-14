@@ -123,8 +123,8 @@ HOOK_CONFIG = {
                 "matcher": "mcp__servicenow__(sn_update_record|sn_create_record|sn_update_widget|sn_update_script_include)",
                 "hooks": [
                     {
-                        "type": "confirm",
-                        "message": "ServiceNow write operation -- confirm before proceeding"
+                        "type": "prompt",
+                        "prompt": "This is a ServiceNow write operation. Review the tool arguments and decide: should this proceed? Reply with ALLOW to proceed or DENY with a reason to block it."
                     }
                 ]
             }
@@ -162,8 +162,10 @@ def _install_hooks():
 
     matcher = HOOK_CONFIG["hooks"]["PreToolUse"][0]["matcher"]
 
-    # Also clean up any old sn-fujidev-mcp hooks
-    pre_tool = [h for h in pre_tool if "sn-fujidev-mcp" not in h.get("matcher", "")]
+    # Clean up old/broken hooks (old name or invalid "confirm" type)
+    pre_tool = [h for h in pre_tool
+                if "sn-fujidev-mcp" not in h.get("matcher", "")
+                and not any(hook.get("type") == "confirm" for hook in h.get("hooks", []))]
 
     already = any(h.get("matcher") == matcher for h in pre_tool)
     if already:
@@ -176,6 +178,11 @@ def _install_hooks():
 
     settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"  Hooks installed -> {settings_file}")
+
+
+def _find_python() -> str:
+    """Find the absolute path to the Python that has servicenow_mcp installed."""
+    return sys.executable
 
 
 def _install_mcp_server():
@@ -192,20 +199,25 @@ def _install_mcp_server():
         del servers["sn-fujidev-mcp"]
         print("  Removed old sn-fujidev-mcp entry")
 
-    current = servers.get(MCP_KEY, {})
+    python_path = _find_python()
+    expected = {
+        "command": python_path,
+        "args": ["-m", "servicenow_mcp.server"]
+    }
 
-    if current.get("command") == "servicenow-mcp" and "args" not in current:
+    current = servers.get(MCP_KEY, {})
+    if current == expected:
         print("  MCP server already registered correctly -- skipping")
     else:
-        servers[MCP_KEY] = {
-            "command": "servicenow-mcp"
-        }
+        servers[MCP_KEY] = expected
         mcp_config["mcpServers"] = servers
         mcp_file.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
         if current:
             print(f"  MCP server UPDATED -> {mcp_file}")
         else:
             print(f"  MCP server registered -> {mcp_file}")
+        print(f"  Python: {python_path}")
+        print(f"  Module: servicenow_mcp.server")
 
 
 def main():
