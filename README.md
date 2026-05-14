@@ -31,12 +31,21 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) MCP server that 
 
 ## Install
 
+**macOS / Linux:**
+```bash
+pip3 install git+https://github.com/R2gers/servicenow-mcp.git
+servicenow-mcp-setup
+```
+
+**Windows:**
 ```bash
 pip install git+https://github.com/R2gers/servicenow-mcp.git
 servicenow-mcp-setup
 ```
 
-That's it. The setup command registers the MCP server, installs the `/servicenow` skill, and adds confirmation hooks. Restart Claude Code after setup.
+That's it. The setup command auto-detects your Python path, registers the MCP server, installs the `/servicenow` skill, and adds confirmation hooks. Restart Claude Code after setup.
+
+> **Tip:** If `pip3` is not found, try `python3 -m pip install ...` instead.
 
 ### Configure your instance
 
