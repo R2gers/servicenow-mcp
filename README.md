@@ -156,8 +156,8 @@ After setup, type `/servicenow` in Claude Code to activate the guided workflow. 
 Your project folder/
   .env                    <-- your ServiceNow credentials (never committed)
 
+~/.claude.json            <-- servicenow-mcp registered here (user-level MCP config)
 ~/.claude/
-  mcp.json                <-- servicenow-mcp registered here
   settings.json           <-- confirmation hooks live here
   skills/servicenow-mcp/  <-- /servicenow skill installed here
 ```

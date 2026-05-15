@@ -186,7 +186,9 @@ def _find_python() -> str:
 
 
 def _install_mcp_server():
-    mcp_file = _claude_dir() / "mcp.json"
+    # Claude Code reads MCP config from ~/.claude.json (user-level config),
+    # NOT from ~/.claude/mcp.json. Write to the correct location.
+    mcp_file = Path.home() / ".claude.json"
     if mcp_file.exists():
         mcp_config = json.loads(mcp_file.read_text(encoding="utf-8"))
     else:
@@ -218,6 +220,21 @@ def _install_mcp_server():
             print(f"  MCP server registered -> {mcp_file}")
         print(f"  Python: {python_path}")
         print(f"  Module: servicenow_mcp.server")
+
+    # Clean up old ~/.claude/mcp.json if it exists (wrong location)
+    old_mcp = _claude_dir() / "mcp.json"
+    if old_mcp.exists():
+        old_config = json.loads(old_mcp.read_text(encoding="utf-8"))
+        old_servers = old_config.get("mcpServers", {})
+        if MCP_KEY in old_servers or "sn-fujidev-mcp" in old_servers:
+            old_servers.pop(MCP_KEY, None)
+            old_servers.pop("sn-fujidev-mcp", None)
+            if old_servers:
+                old_config["mcpServers"] = old_servers
+                old_mcp.write_text(json.dumps(old_config, indent=2), encoding="utf-8")
+            else:
+                old_mcp.unlink()
+            print(f"  Cleaned up old config -> {old_mcp}")
 
 
 def main():
