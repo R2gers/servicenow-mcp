@@ -1,0 +1,5 @@
+servicenow-mcp: WARNING - No .env file found at D:\Dev\SN\MCPInstances\claudeMCP\.env. Create a .env in your project folder with:
+  SERVICENOW_INSTANCE_URL=https://yourinstance.service-now.com
+  SERVICENOW_USERNAME=your_user
+  SERVICENOW_PASSWORD=your_pass
+servicenow-mcp: Server will start but tools will return errors until .env is configured.

@@ -3,8 +3,8 @@ import sys
 sys.path.insert(0, ".")
 
 from servicenow_mcp.server import (
-    _guard_table, _guard_fields, _guard_no_wipe,
-    BLOCKED_TABLES
+    _guard_table, _guard_fields, _guard_no_wipe, _guard_restricted_fields,
+    BLOCKED_TABLES, RESTRICTED_TABLES
 )
 
 passed = 0
@@ -37,8 +37,6 @@ test("Block sys_security_acl update",
      lambda: _guard_table("sys_security_acl", "update"))
 test("Block sys_properties create",
      lambda: _guard_table("sys_properties", "create"))
-test("Block sys_update_set update",
-     lambda: _guard_table("sys_update_set", "update"))
 test("Block sys_store_app create",
      lambda: _guard_table("sys_store_app", "create"))
 
@@ -59,6 +57,22 @@ test("Allow sp_widget update",
      lambda: _guard_table("sp_widget", "update"), expect_error=False)
 test("Allow custom table",
      lambda: _guard_table("x_fusi_presales_request", "update"), expect_error=False)
+
+print("\n--- Restricted tables (sys_update_set) ---")
+test("Block sys_update_set create",
+     lambda: _guard_table("sys_update_set", "create"))
+test("Allow sys_update_set update (table level)",
+     lambda: _guard_table("sys_update_set", "update"), expect_error=False)
+test("Allow description update on sys_update_set",
+     lambda: _guard_restricted_fields("sys_update_set", {"description": "Session recap"}), expect_error=False)
+test("Block name update on sys_update_set",
+     lambda: _guard_restricted_fields("sys_update_set", {"name": "Hacked"}))
+test("Block state update on sys_update_set",
+     lambda: _guard_restricted_fields("sys_update_set", {"state": "complete"}))
+test("Block mixed fields on sys_update_set (description + name)",
+     lambda: _guard_restricted_fields("sys_update_set", {"description": "ok", "name": "bad"}))
+test("No restriction on normal tables",
+     lambda: _guard_restricted_fields("incident", {"name": "test", "state": "1"}), expect_error=False)
 
 print("\n--- Blocked fields ---")
 test("Block sys_id modification",

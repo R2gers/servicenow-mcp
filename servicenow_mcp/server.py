@@ -365,9 +365,14 @@ BLOCKED_TABLES = frozenset({
     "sys_security_acl", "sys_security_acl_role",
     "sys_properties", "sys_db_object", "sys_glide_object",
     "sys_cluster_state", "sys_upgrade_history",
-    "sys_update_set",  # prevent accidental update set corruption
     "sys_store_app",
 })
+
+# Tables with restricted write access — only the listed fields may be updated.
+# Creates are still blocked entirely.
+RESTRICTED_TABLES = {
+    "sys_update_set": frozenset({"description"}),
+}
 
 BLOCKED_FIELDS = frozenset({
     "sys_id", "sys_created_by", "sys_created_on",
@@ -380,6 +385,26 @@ def _guard_table(table: str, operation: str):
         raise PermissionError(
             f"BLOCKED: {operation} on protected table '{table}' is not allowed. "
             f"This restriction is enforced at the server level and cannot be overridden."
+        )
+    if table in RESTRICTED_TABLES and operation == "create":
+        raise PermissionError(
+            f"BLOCKED: create on restricted table '{table}' is not allowed. "
+            f"Only updates to {sorted(RESTRICTED_TABLES[table])} are permitted. "
+            f"This restriction is enforced at the server level and cannot be overridden."
+        )
+
+
+def _guard_restricted_fields(table: str, data: dict):
+    """For restricted tables, only allow the whitelisted fields."""
+    if table not in RESTRICTED_TABLES:
+        return
+    allowed = RESTRICTED_TABLES[table]
+    forbidden = set(data.keys()) - allowed
+    if forbidden:
+        raise PermissionError(
+            f"BLOCKED: Cannot modify fields {sorted(forbidden)} on restricted table '{table}'. "
+            f"Only {sorted(allowed)} may be updated. "
+            f"This restriction is enforced at the server level."
         )
 
 
@@ -427,6 +452,7 @@ def _dispatch(name: str, args: dict) -> Any:
 
     elif name == "sn_update_record":
         _guard_table(args["table"], "update")
+        _guard_restricted_fields(args["table"], args["data"])
         _guard_fields(args["data"])
         _guard_no_wipe(args["data"], f"{args['table']}/{args['sys_id']}")
         r = requests.patch(f"{base}/api/now/table/{args['table']}/{args['sys_id']}",
