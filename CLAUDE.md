@@ -38,7 +38,10 @@ SERVICENOW_USERNAME=your_username
 SERVICENOW_PASSWORD=your_password
 ```
 
-Do NOT commit this file. It should already be in `.gitignore`.
+**IMPORTANT:**
+- The `.env` MUST go in the project folder, NEVER in `~/.claude/`, `~/.claude.json`, or any global location.
+- NEVER pass credentials via `-e` flags in the MCP registration. The server reads `.env` at runtime.
+- Do NOT commit this file. It should already be in `.gitignore`.
 
 ### Step 4 -- Restart Claude Code
 
