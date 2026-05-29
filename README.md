@@ -120,7 +120,8 @@ Hardcoded in Python. No prompt injection or LLM instruction can override these:
 | Guard | Details |
 |-------|---------|
 | **No DELETE** | No delete tool exists. Period. |
-| **Protected tables** | `sys_security_acl`, `sys_properties`, `sys_db_object`, `sys_update_set`, `sys_store_app`, and others |
+| **Protected tables** | `sys_security_acl`, `sys_properties`, `sys_db_object`, `sys_store_app`, and others |
+| **Restricted tables** | `sys_update_set` -- only the `description` field can be updated (for session recaps) |
 | **Protected fields** | `sys_id`, `sys_created_by`, `sys_created_on`, `sys_mod_count`, `sys_class_name` |
 | **Anti-wipe** | Cannot set any text field to an empty string |
 

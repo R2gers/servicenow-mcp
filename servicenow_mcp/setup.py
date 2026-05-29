@@ -100,7 +100,7 @@ Example recap format:
 --- Session 2026-05-14 ---
 - Created widget: ps-dashboard (sys_id: abc123)
 - Created page: dashboard (sys_id: def456)
-- Updated script include: PresalesUtils (sys_id: ghi789)
+- Updated script include: MyScriptInclude (sys_id: ghi789)
 - Modified widget template: ps-opportunities
 ```
 
@@ -164,7 +164,7 @@ def _install_hooks():
 
     # Clean up old/broken hooks (old name or invalid "confirm" type)
     pre_tool = [h for h in pre_tool
-                if "sn-fujidev-mcp" not in h.get("matcher", "")
+                if "sn-legacy-mcp" not in h.get("matcher", "")
                 and not any(hook.get("type") == "confirm" for hook in h.get("hooks", []))]
 
     already = any(h.get("matcher") == matcher for h in pre_tool)
@@ -196,10 +196,10 @@ def _install_mcp_server():
 
     servers = mcp_config.get("mcpServers", {})
 
-    # Clean up old sn-fujidev-mcp entry if present
-    if "sn-fujidev-mcp" in servers:
-        del servers["sn-fujidev-mcp"]
-        print("  Removed old sn-fujidev-mcp entry")
+    # Clean up old sn-legacy-mcp entry if present
+    if "sn-legacy-mcp" in servers:
+        del servers["sn-legacy-mcp"]
+        print("  Removed old sn-legacy-mcp entry")
 
     python_path = _find_python()
     expected = {
@@ -226,9 +226,9 @@ def _install_mcp_server():
     if old_mcp.exists():
         old_config = json.loads(old_mcp.read_text(encoding="utf-8"))
         old_servers = old_config.get("mcpServers", {})
-        if MCP_KEY in old_servers or "sn-fujidev-mcp" in old_servers:
+        if MCP_KEY in old_servers or "sn-legacy-mcp" in old_servers:
             old_servers.pop(MCP_KEY, None)
-            old_servers.pop("sn-fujidev-mcp", None)
+            old_servers.pop("sn-legacy-mcp", None)
             if old_servers:
                 old_config["mcpServers"] = old_servers
                 old_mcp.write_text(json.dumps(old_config, indent=2), encoding="utf-8")

@@ -192,8 +192,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "table":  {"type": "string", "description": "Table name, e.g. x_fusi_presales_request"},
-                    "query":  {"type": "string", "description": "Encoded query, e.g. state=7^category=presales. Leave empty for all."},
+                    "table":  {"type": "string", "description": "Table name, e.g. incident"},
+                    "query":  {"type": "string", "description": "Encoded query, e.g. state=7^category=hardware. Leave empty for all."},
                     "fields": {"type": "string", "description": "Comma-separated field names. Leave empty for defaults."},
                     "limit":  {"type": "integer", "description": "Max records to return (default 20, max 200)", "default": 20},
                 },
@@ -271,7 +271,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "scope":  {"type": "string", "description": "Scope string e.g. x_fusi_presales"},
+                    "scope":  {"type": "string", "description": "Scope string e.g. x_myapp_custom"},
                     "search": {"type": "string", "description": "Text to search in name or id"},
                 },
             },
@@ -282,8 +282,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "portal_url_suffix": {"type": "string", "description": "Portal url_suffix e.g. presales"},
-                    "scope":             {"type": "string", "description": "Scope e.g. x_fusi_presales"},
+                    "portal_url_suffix": {"type": "string", "description": "Portal url_suffix e.g. sp"},
+                    "scope":             {"type": "string", "description": "Scope e.g. x_myapp_custom"},
                 },
             },
         ),
@@ -304,7 +304,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "name":   {"type": "string", "description": "Script include name e.g. PresalesUtils"},
+                    "name":   {"type": "string", "description": "Script include name e.g. MyScriptInclude"},
                     "sys_id": {"type": "string"},
                 },
             },

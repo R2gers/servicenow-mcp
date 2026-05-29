@@ -56,7 +56,7 @@ test("Allow incident create",
 test("Allow sp_widget update",
      lambda: _guard_table("sp_widget", "update"), expect_error=False)
 test("Allow custom table",
-     lambda: _guard_table("x_fusi_presales_request", "update"), expect_error=False)
+     lambda: _guard_table("x_myapp_custom_table", "update"), expect_error=False)
 
 print("\n--- Restricted tables (sys_update_set) ---")
 test("Block sys_update_set create",
