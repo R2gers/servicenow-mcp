@@ -186,42 +186,34 @@ def _find_python() -> str:
 
 
 def _install_mcp_server():
-    # Claude Code reads MCP config from ~/.claude.json (user-level config),
-    # NOT from ~/.claude/mcp.json. Write to the correct location.
-    mcp_file = Path.home() / ".claude.json"
-    if mcp_file.exists():
-        mcp_config = json.loads(mcp_file.read_text(encoding="utf-8"))
-    else:
-        mcp_config = {}
-
-    servers = mcp_config.get("mcpServers", {})
-
-    # Clean up old sn-legacy-mcp entry if present
-    if "sn-legacy-mcp" in servers:
-        del servers["sn-legacy-mcp"]
-        print("  Removed old sn-legacy-mcp entry")
-
     python_path = _find_python()
-    expected = {
-        "command": python_path,
-        "args": ["-m", "servicenow_mcp.server"]
-    }
 
-    current = servers.get(MCP_KEY, {})
-    if current == expected:
-        print("  MCP server already registered correctly -- skipping")
-    else:
-        servers[MCP_KEY] = expected
-        mcp_config["mcpServers"] = servers
-        mcp_file.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
-        if current:
-            print(f"  MCP server UPDATED -> {mcp_file}")
-        else:
-            print(f"  MCP server registered -> {mcp_file}")
+    # Use `claude mcp add` (the officially supported CLI command).
+    # This is safe to run while Claude Code is open -- no race conditions.
+    import subprocess
+
+    # Remove any existing entry first (claude mcp add won't overwrite)
+    subprocess.run(
+        ["claude", "mcp", "remove", MCP_KEY, "-s", "user"],
+        capture_output=True
+    )
+
+    result = subprocess.run(
+        ["claude", "mcp", "add", MCP_KEY, "-s", "user",
+         "--", python_path, "-m", "servicenow_mcp.server"],
+        capture_output=True, text=True
+    )
+
+    if result.returncode == 0:
+        print(f"  MCP server registered via `claude mcp add`")
         print(f"  Python: {python_path}")
         print(f"  Module: servicenow_mcp.server")
+    else:
+        # Fallback: write directly to ~/.claude.json if `claude` CLI not found
+        print(f"  `claude` CLI not found, falling back to direct config write...")
+        _install_mcp_server_fallback(python_path)
 
-    # Clean up old ~/.claude/mcp.json if it exists (wrong location)
+    # Clean up old ~/.claude/mcp.json if it exists (wrong location from v0.1)
     old_mcp = _claude_dir() / "mcp.json"
     if old_mcp.exists():
         old_config = json.loads(old_mcp.read_text(encoding="utf-8"))
@@ -235,6 +227,29 @@ def _install_mcp_server():
             else:
                 old_mcp.unlink()
             print(f"  Cleaned up old config -> {old_mcp}")
+
+
+def _install_mcp_server_fallback(python_path: str):
+    """Direct config write -- used only when `claude` CLI is not on PATH."""
+    mcp_file = Path.home() / ".claude.json"
+    if mcp_file.exists():
+        mcp_config = json.loads(mcp_file.read_text(encoding="utf-8"))
+    else:
+        mcp_config = {}
+
+    servers = mcp_config.get("mcpServers", {})
+
+    if "sn-legacy-mcp" in servers:
+        del servers["sn-legacy-mcp"]
+        print("  Removed old sn-legacy-mcp entry")
+
+    servers[MCP_KEY] = {
+        "command": python_path,
+        "args": ["-m", "servicenow_mcp.server"]
+    }
+    mcp_config["mcpServers"] = servers
+    mcp_file.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
+    print(f"  MCP server registered -> {mcp_file}")
 
 
 def main():

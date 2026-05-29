@@ -31,6 +31,16 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) MCP server that 
 
 ## Install
 
+### Option A: Let Claude do it
+
+Open Claude Code and say:
+
+> Set up the servicenow-mcp for me: https://github.com/R2gers/servicenow-mcp
+
+Claude will install the package, run setup, and help you create the `.env` file.
+
+### Option B: Manual install
+
 **macOS / Linux:**
 ```bash
 pip3 install git+https://github.com/R2gers/servicenow-mcp.git
@@ -43,7 +53,7 @@ pip install git+https://github.com/R2gers/servicenow-mcp.git
 servicenow-mcp-setup
 ```
 
-That's it. The setup command auto-detects your Python path, registers the MCP server, installs the `/servicenow` skill, and adds confirmation hooks. Restart Claude Code after setup.
+Restart Claude Code after setup.
 
 > **Tip:** If `pip3` is not found, try `python3 -m pip install ...` instead.
 
@@ -157,7 +167,7 @@ After setup, type `/servicenow` in Claude Code to activate the guided workflow. 
 Your project folder/
   .env                    <-- your ServiceNow credentials (never committed)
 
-~/.claude.json            <-- servicenow-mcp registered here (user-level MCP config)
+~/.claude.json            <-- servicenow-mcp registered here (via `claude mcp add`)
 ~/.claude/
   settings.json           <-- confirmation hooks live here
   skills/servicenow-mcp/  <-- /servicenow skill installed here
@@ -170,10 +180,11 @@ Claude Code starts the MCP server automatically. The server reads `.env` from yo
 ## Uninstall
 
 ```bash
+claude mcp remove servicenow -s user
 pip uninstall servicenow-mcp
 ```
 
-Then remove `servicenow` from `~/.claude/mcp.json` and the hook from `~/.claude/settings.json`.
+Then remove the hook from `~/.claude/settings.json` and the skill folder `~/.claude/skills/servicenow-mcp/`.
 
 ---
 
