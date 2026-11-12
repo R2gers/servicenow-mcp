@@ -1,9 +1,9 @@
 ---
 name: servicenow
 description: >
-  ServiceNow development workflow skill. Handles widget creation with correct
-  page hierarchy (Page->Container->Row->Column->Instance), scope/update set
-  verification, and session recaps for update set descriptions.
+  ServiceNow development workflow skill. Covers business rules, client scripts,
+  UI policies, script includes, Service Portal widgets, and general table
+  operations with scope/update set verification and session recaps.
 trigger: /servicenow
 ---
 
@@ -18,62 +18,82 @@ You are assisting a ServiceNow developer using the servicenow-mcp tools.
 2. Wait for confirmation. Do NOT proceed with creates/updates until confirmed.
 3. Note the scope and update set for the session recap later.
 
-## Widget + Page Creation Workflow
+## Common Development Tables
 
-When asked to create a widget and place it on a page, follow this EXACT sequence:
+Use `sn_create_record` and `sn_update_record` with these tables:
 
-### Step 1 -- Create or locate the Widget
-```
-sn_create_record(table="sp_widget", data={name, id, template, client_script, script, css})
-```
+| What | Table | Key Fields |
+|------|-------|------------|
+| Business Rule | `sys_script` | `name`, `table`, `script`, `when` (before/after/async), `order`, `active` |
+| Client Script | `sys_script_client` | `name`, `table`, `script`, `type` (onLoad/onChange/onSubmit/onCellEdit), `active` |
+| UI Policy | `sys_ui_policy` | `short_description`, `table`, `conditions`, `script_true`, `script_false`, `active` |
+| UI Action | `sys_ui_action` | `name`, `table`, `script`, `action_name`, `active`, `order` |
+| Script Include | `sys_script_include` | `name`, `script`, `api_name`, `active`, `client_callable` |
+| Scheduled Job | `sysauto_script` | `name`, `script`, `run_type`, `active` |
+| Fix Script | `sys_script_fix` | `name`, `script`, `description` |
+| UI Page | `sys_ui_page` | `name`, `html`, `client_script`, `processing_script` |
+| Notification | `sysevent_email_action` | `name`, `event_name`, `subject`, `message_html`, `active` |
+| ACL | (blocked by default) | Override in guards.json if needed |
 
-### Step 2 -- Create or locate the Page
+### Business Rule Example
 ```
-sn_create_record(table="sp_page", data={title, id})
-```
-
-### Step 3 -- Create the Container
-```
-sn_create_record(table="sp_container", data={
-  sp_page: "<page_sys_id>",
-  order: 100,
-  name: "Main"
+sn_create_record(table="sys_script", data={
+  "name": "Set priority on VIP caller",
+  "table": "incident",
+  "when": "before",
+  "order": 100,
+  "active": "true",
+  "script": "(function executeRule(current, previous) {\n  if (current.caller_id.vip == 'true') {\n    current.priority = 1;\n  }\n})(current, previous);"
 })
 ```
 
-### Step 4 -- Create the Row
+### Client Script Example
 ```
-sn_create_record(table="sp_row", data={
-  sp_container: "<container_sys_id>",
-  order: 100
+sn_create_record(table="sys_script_client", data={
+  "name": "Auto-populate assignment group",
+  "table": "incident",
+  "type": "onChange",
+  "field_name": "category",
+  "active": "true",
+  "script": "function onChange(control, oldValue, newValue, isLoading) {\n  if (isLoading) return;\n  // your logic here\n}"
 })
 ```
 
-### Step 5 -- Create the Column
-```
-sn_create_record(table="sp_column", data={
-  sp_row: "<row_sys_id>",
-  order: 100,
-  size_md: 12
-})
-```
+## Service Portal: Widget + Page Creation
 
-### Step 6 -- Create the Widget Instance
-```
-sn_create_record(table="sp_instance", data={
-  sp_widget: "<widget_sys_id>",
-  sp_column: "<column_sys_id>",
-  order: 100
-})
-```
+When placing a widget on a Service Portal page, you MUST create the full hierarchy:
+
+1. Create the **Widget** (`sp_widget`) — `name`, `id`, `template`, `client_script`, `script`, `css`
+2. Create the **Page** (`sp_page`) — `title`, `id`
+3. Create a **Container** (`sp_container`) — `sp_page`: page sys_id
+4. Create a **Row** (`sp_row`) — `sp_container`: container sys_id
+5. Create a **Column** (`sp_column`) — `sp_row`: row sys_id, `size_md`: 12
+6. Create the **Widget Instance** (`sp_instance`) — `sp_widget`: widget sys_id, `sp_column`: column sys_id
 
 **NEVER skip steps 3-5.** A widget cannot be placed on a page without Container -> Row -> Column.
 
 ## Before Updating Anything
 
-1. Always **read first**: use `sn_get_widget` or `sn_get_record` before any update.
+1. Always **read first**: use `sn_get_widget`, `sn_get_record`, or `sn_get_script_include` before any update.
 2. Show the user what will change (diff the old vs new).
 3. Wait for confirmation before applying.
+
+## Configurable Table Guards
+
+Table access is controlled by `guards.json`. The package ships with safe defaults (blocking ACLs, sys_properties, etc.).
+
+To customize for your project, create a `guards.json` next to your `.env`:
+```json
+{
+  "blocked_tables": ["sys_security_acl", "sys_properties"],
+  "restricted_tables": {
+    "sys_update_set": ["description"]
+  },
+  "blocked_fields": ["sys_id", "sys_created_by", "sys_created_on"]
+}
+```
+
+Only include the sections you want to change — omitted sections keep defaults.
 
 ## Session End Protocol
 
@@ -84,17 +104,19 @@ When the session is wrapping up or the user says they're done:
 
 Example recap format:
 ```
---- Session 2026-05-14 ---
-- Created widget: ps-dashboard (sys_id: abc123)
-- Created page: dashboard (sys_id: def456)
+--- Session 2026-11-12 ---
+- Created business rule: Set priority on VIP caller (sys_id: abc123)
+- Created client script: Auto-populate assignment group (sys_id: def456)
 - Updated script include: MyScriptInclude (sys_id: ghi789)
-- Modified widget template: ps-opportunities
+- Created widget: ps-dashboard + placed on page: dashboard
 ```
 
 ## Common Pitfalls to Avoid
 
 - **Reference fields**: Always use sys_id values, never display values
 - **Encoded queries**: Use ^ for AND, ^OR for OR, CONTAINS not LIKE for partial matches
-- **Widget updates**: Never overwrite template/script without reading current version first
+- **Script updates**: Never overwrite a script without reading the current version first
 - **Bulk operations**: Never update more than 10 records without explicit user OK
 - **Deletions**: Suggest deactivation (active=false) instead of deletion
+- **Business rule `when`**: Must be `before`, `after`, `async`, or `display`
+- **Client script `type`**: Must be `onLoad`, `onChange`, `onSubmit`, or `onCellEdit`

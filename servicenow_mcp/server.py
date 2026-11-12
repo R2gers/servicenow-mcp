@@ -398,25 +398,40 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"ERROR: {e}")]
 
 
-# ── Hard Safety Guards (code-level, cannot be bypassed by the LLM) ───────────
+# ── Safety Guards (configurable via guards.json) ─────────────────────────────
 
-BLOCKED_TABLES = frozenset({
-    "sys_security_acl", "sys_security_acl_role",
-    "sys_properties", "sys_db_object", "sys_glide_object",
-    "sys_cluster_state", "sys_upgrade_history",
-    "sys_store_app",
-})
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
-# Tables with restricted write access — only the listed fields may be updated.
-# Creates are still blocked entirely.
+
+def _load_guards():
+    """Load guard config: project-level guards.json overrides, then package defaults."""
+    # Package defaults
+    default_path = os.path.join(_DATA_DIR, "guards.json")
+    with open(default_path, encoding="utf-8") as f:
+        guards = json.load(f)
+
+    # Project-level override (next to .env)
+    project_path = os.path.join(os.getcwd(), "guards.json")
+    if os.path.exists(project_path):
+        with open(project_path, encoding="utf-8") as f:
+            overrides = json.load(f)
+        if "blocked_tables" in overrides:
+            guards["blocked_tables"] = overrides["blocked_tables"]
+        if "restricted_tables" in overrides:
+            guards["restricted_tables"] = overrides["restricted_tables"]
+        if "blocked_fields" in overrides:
+            guards["blocked_fields"] = overrides["blocked_fields"]
+        print(f"servicenow-mcp: loaded project guards from {project_path}", file=sys.stderr)
+
+    return guards
+
+
+_guards = _load_guards()
+BLOCKED_TABLES = frozenset(_guards["blocked_tables"])
 RESTRICTED_TABLES = {
-    "sys_update_set": frozenset({"description"}),
+    table: frozenset(fields) for table, fields in _guards.get("restricted_tables", {}).items()
 }
-
-BLOCKED_FIELDS = frozenset({
-    "sys_id", "sys_created_by", "sys_created_on",
-    "sys_mod_count", "sys_class_name",
-})
+BLOCKED_FIELDS = frozenset(_guards["blocked_fields"])
 
 
 def _guard_table(table: str, operation: str):

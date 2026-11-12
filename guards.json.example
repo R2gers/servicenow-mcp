@@ -1,0 +1,26 @@
+{
+  "_comment": "Place this file as guards.json next to your .env to override the default table guards. Only include the sections you want to change — omitted sections keep their defaults.",
+
+  "blocked_tables": [
+    "sys_security_acl",
+    "sys_security_acl_role",
+    "sys_properties",
+    "sys_db_object",
+    "sys_glide_object",
+    "sys_cluster_state",
+    "sys_upgrade_history",
+    "sys_store_app"
+  ],
+
+  "restricted_tables": {
+    "sys_update_set": ["description"]
+  },
+
+  "blocked_fields": [
+    "sys_id",
+    "sys_created_by",
+    "sys_created_on",
+    "sys_mod_count",
+    "sys_class_name"
+  ]
+}
