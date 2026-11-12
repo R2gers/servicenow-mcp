@@ -26,6 +26,45 @@ _env_loaded = False
 _env_error = None  # type: str | None
 
 
+def _check_for_updates():
+    """Non-blocking version check against GitHub. Prints a notice if outdated."""
+    try:
+        from servicenow_mcp import __version__, __repo__
+        import urllib.request
+        import json as _json
+
+        api_url = "https://raw.githubusercontent.com/R2gers/servicenow-mcp/master/servicenow_mcp/__init__.py"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "servicenow-mcp"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            content = resp.read().decode("utf-8")
+
+        remote_version = None
+        for line in content.splitlines():
+            if line.startswith("__version__"):
+                remote_version = line.split("=")[1].strip().strip('"').strip("'")
+                break
+
+        if remote_version and remote_version != __version__:
+            def _parse_ver(v):
+                try:
+                    return tuple(int(x) for x in v.split("."))
+                except Exception:
+                    return (0,)
+            is_newer = _parse_ver(remote_version) > _parse_ver(__version__)
+            if is_newer:
+                print(
+                    f"servicenow-mcp: UPDATE AVAILABLE {__version__} -> {remote_version}  "
+                    f"Run: servicenow-mcp-update",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"servicenow-mcp: v{__version__} (up to date)", file=sys.stderr)
+        else:
+            print(f"servicenow-mcp: v{__version__} (up to date)", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _load_env():
     """Resolve and load .env. Never crashes — sets _env_error if something is wrong."""
     global _env_loaded, _env_error
@@ -591,6 +630,7 @@ def _dispatch(name: str, args: dict) -> Any:
 
 async def main():
     _load_env()
+    _check_for_updates()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

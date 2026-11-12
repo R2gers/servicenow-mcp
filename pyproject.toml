@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "servicenow-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "ServiceNow MCP Server for Claude Code — query, update, and manipulate any ServiceNow instance with built-in safety guards."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,3 +30,7 @@ Issues = "https://github.com/R2gers/servicenow-mcp/issues"
 [project.scripts]
 servicenow-mcp = "servicenow_mcp.server:main_sync"
 servicenow-mcp-setup = "servicenow_mcp.setup:main"
+servicenow-mcp-update = "servicenow_mcp.setup:update"
+
+[tool.hatch.build.targets.wheel]
+packages = ["servicenow_mcp"]
