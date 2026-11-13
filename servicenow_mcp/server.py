@@ -9,6 +9,7 @@ directory (or passed via --env-file). Will NOT start without valid credentials.
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -137,8 +138,10 @@ def _get_token() -> str:
             "password":      os.environ["SERVICENOW_PASSWORD"],
         },
         timeout=15,
+        allow_redirects=False,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        raise RuntimeError(f"OAuth token request failed. {_error_message(resp)}")
     data = resp.json()
     _token_cache["token"]   = data["access_token"]
     _token_cache["expires"] = now + data.get("expires_in", 1800)
@@ -164,7 +167,12 @@ def _headers() -> dict:
 
 
 def _base() -> str:
-    return os.environ["SERVICENOW_INSTANCE_URL"]
+    base = os.environ["SERVICENOW_INSTANCE_URL"].strip().rstrip("/")
+    if not base.lower().startswith("https://"):
+        raise RuntimeError(
+            "SERVICENOW_INSTANCE_URL must start with https:// -- refusing to send credentials over plain HTTP."
+        )
+    return base
 
 
 # ── Server Instructions ──────────────────────────────────────────────────────
@@ -374,16 +382,114 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# ── Input validation ─────────────────────────────────────────────────────────
+# Table names and sys_ids are placed in the URL path, so they are validated
+# strictly BEFORE any guard runs. Without this, a value such as
+# "incident/../sys_properties" passes the guard and is then normalised by the
+# HTTP library into a request against the protected table.
+
+_TABLE_RE = re.compile(r"^[a-z0-9_]{1,80}$")
+_SYS_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _valid_table(table: Any) -> str:
+    if not isinstance(table, str) or not _TABLE_RE.fullmatch(table):
+        raise ValueError(
+            f"BLOCKED: invalid table name {table!r}. Table names may only contain "
+            f"lowercase letters, digits and underscores (e.g. 'incident', 'x_myapp_task')."
+        )
+    return table
+
+
+def _valid_sys_id(sys_id: Any) -> str:
+    if not isinstance(sys_id, str) or not _SYS_ID_RE.fullmatch(sys_id):
+        raise ValueError(
+            f"BLOCKED: invalid sys_id {sys_id!r}. A sys_id is exactly 32 lowercase hex characters."
+        )
+    return sys_id
+
+
+def _is_sys_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_SYS_ID_RE.fullmatch(value))
+
+
+def _table_path(table: str, sys_id: str | None = None) -> str:
+    path = f"/api/now/table/{_valid_table(table)}"
+    if sys_id is not None:
+        path += f"/{_valid_sys_id(sys_id)}"
+    return path
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+def _timeout() -> float:
+    try:
+        return max(1.0, float(os.environ.get("SERVICENOW_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
+
+
+_STATUS_HINTS = {
+    401: "Authentication failed. Check the credentials in .env.",
+    403: "The ServiceNow user is not allowed to do this (ACL or cross-scope access policy).",
+    404: "Not found. The table or record does not exist, or an ACL hides it from this user.",
+    429: "Rate limit reached on the instance. Wait before retrying.",
+}
+
+
+def _error_message(resp) -> str:
+    """Build a useful message from a failed ServiceNow response."""
+    parts = [f"ServiceNow returned HTTP {resp.status_code}"]
+    try:
+        err = resp.json().get("error", {})
+        if isinstance(err, dict):
+            if err.get("message"): parts.append(str(err["message"]))
+            if err.get("detail"):  parts.append(str(err["detail"]))
+        elif err:
+            parts.append(str(err))
+    except Exception:
+        if 300 <= resp.status_code < 400:
+            parts.append("Unexpected redirect (SSO login page?). Basic auth may be disabled for this user.")
+    hint = _STATUS_HINTS.get(resp.status_code)
+    if hint:
+        parts.append(hint)
+    if resp.status_code == 429 and resp.headers.get("Retry-After"):
+        parts.append(f"Retry-After: {resp.headers['Retry-After']}s")
+    return " | ".join(parts)
+
+
+def _request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None) -> Any:
+    """Single entry point for every ServiceNow API call: timeout, no redirects, real errors."""
+    try:
+        resp = requests.request(
+            method, f"{_base()}{path}",
+            headers=_headers(), params=params, json=json_body,
+            timeout=_timeout(), allow_redirects=False,
+        )
+    except requests.Timeout:
+        raise RuntimeError(
+            f"ServiceNow did not answer within {_timeout():g}s ({method} {path}). "
+            f"Narrow the query or raise SERVICENOW_TIMEOUT in .env."
+        ) from None
+    except requests.RequestException as e:
+        raise RuntimeError(f"Could not reach ServiceNow ({type(e).__name__}): {e}") from None
+
+    if not resp.ok or 300 <= resp.status_code < 400:
+        raise RuntimeError(_error_message(resp))
+    try:
+        return resp.json().get("result")
+    except ValueError:
+        raise RuntimeError(
+            "ServiceNow returned a non-JSON response. The instance may be hibernating, "
+            "or the request was sent to a login page."
+        ) from None
+
+
 def _resolve_widget_sys_id(widget_id: str) -> str:
-    if len(widget_id) == 32 and all(c in "0123456789abcdef" for c in widget_id):
+    if _is_sys_id(widget_id):
         return widget_id
-    r = requests.get(
-        f"{_base()}/api/now/table/sp_widget",
-        headers=_headers(),
-        params={"sysparm_query": f"id={widget_id}", "sysparm_fields": "sys_id", "sysparm_limit": 1},
-    )
-    r.raise_for_status()
-    results = r.json().get("result", [])
+    results = _request("GET", _table_path("sp_widget"),
+                       params={"sysparm_query": f"id={widget_id}", "sysparm_fields": "sys_id", "sysparm_limit": 1})
     if not results:
         raise ValueError(f"No widget found with id='{widget_id}'")
     return results[0]["sys_id"]
@@ -391,38 +497,102 @@ def _resolve_widget_sys_id(widget_id: str) -> str:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    try:
-        result = _dispatch(name, arguments)
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
-    except Exception as e:
-        return [TextContent(type="text", text=f"ERROR: {e}")]
+    # Exceptions propagate: the MCP SDK turns them into a result flagged isError,
+    # so the client can tell a failure from data. requests is blocking, so the
+    # work runs in a thread to keep the event loop responsive.
+    result = await asyncio.to_thread(_dispatch, name, arguments)
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
-# ── Safety Guards (configurable via guards.json) ─────────────────────────────
+# ── Safety Guards ────────────────────────────────────────────────────────────
+# Package defaults live in data/guards.json. A project-level guards.json can
+# ADD restrictions but can never remove a default one: that file sits in a
+# folder the assistant can write to, so it must not be able to loosen guards.
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
-def _load_guards():
-    """Load guard config: project-level guards.json overrides, then package defaults."""
-    # Package defaults
-    default_path = os.path.join(_DATA_DIR, "guards.json")
-    with open(default_path, encoding="utf-8") as f:
-        guards = json.load(f)
+def _norm_list(values: Any) -> set:
+    if not isinstance(values, list):
+        return set()
+    return {str(v).strip().lower() for v in values if str(v).strip()}
 
-    # Project-level override (next to .env)
+
+def _merge_guards(defaults: dict, overrides: dict) -> tuple[dict, list[str]]:
+    """Combine default guards with project overrides, tighten-only.
+
+    Returns (guards, warnings). Warnings list every attempt to loosen a default.
+    """
+    warnings: list[str] = []
+    if not isinstance(overrides, dict):
+        overrides = {}
+        warnings.append("project guards.json is not a JSON object; ignored")
+
+    blocked_tables = _norm_list(defaults.get("blocked_tables"))
+    blocked_fields = _norm_list(defaults.get("blocked_fields"))
+    restricted = {str(t).strip().lower(): _norm_list(f)
+                  for t, f in (defaults.get("restricted_tables") or {}).items()}
+
+    for key, current in (("blocked_tables", blocked_tables), ("blocked_fields", blocked_fields)):
+        if key in overrides:
+            extra = _norm_list(overrides[key])
+            dropped = current - extra
+            if dropped:
+                warnings.append(
+                    f"{key}: project guards.json omits default entries {sorted(dropped)}; "
+                    f"they stay blocked (project guards can only add restrictions)"
+                )
+            current |= extra
+
+    over_restricted = overrides.get("restricted_tables")
+    if isinstance(over_restricted, dict):
+        given = {str(t).strip().lower() for t in over_restricted}
+        dropped = set(restricted) - given
+        if dropped:
+            warnings.append(
+                f"restricted_tables: project guards.json omits default entries {sorted(dropped)}; "
+                f"they stay restricted"
+            )
+        for table, fields in over_restricted.items():
+            table = str(table).strip().lower()
+            wanted = _norm_list(fields)
+            if table in restricted:
+                widened = wanted - restricted[table]
+                if widened:
+                    warnings.append(
+                        f"restricted_tables.{table}: cannot allow extra fields {sorted(widened)}; ignored"
+                    )
+                restricted[table] &= wanted
+            else:
+                restricted[table] = wanted
+
+    return ({
+        "blocked_tables": sorted(blocked_tables),
+        "blocked_fields": sorted(blocked_fields),
+        "restricted_tables": {t: sorted(f) for t, f in restricted.items()},
+    }, warnings)
+
+
+def _load_guards():
+    """Load package defaults, then tighten with a project-level guards.json if present."""
+    with open(os.path.join(_DATA_DIR, "guards.json"), encoding="utf-8") as f:
+        defaults = json.load(f)
+
+    overrides: dict = {}
     project_path = os.path.join(os.getcwd(), "guards.json")
     if os.path.exists(project_path):
-        with open(project_path, encoding="utf-8") as f:
-            overrides = json.load(f)
-        if "blocked_tables" in overrides:
-            guards["blocked_tables"] = overrides["blocked_tables"]
-        if "restricted_tables" in overrides:
-            guards["restricted_tables"] = overrides["restricted_tables"]
-        if "blocked_fields" in overrides:
-            guards["blocked_fields"] = overrides["blocked_fields"]
-        print(f"servicenow-mcp: loaded project guards from {project_path}", file=sys.stderr)
+        try:
+            with open(project_path, encoding="utf-8") as f:
+                overrides = json.load(f)
+            print(f"servicenow-mcp: loaded project guards from {project_path}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            print(f"servicenow-mcp: WARNING - could not read {project_path} ({e}); using default guards",
+                  file=sys.stderr)
+            overrides = {}
 
+    guards, warnings = _merge_guards(defaults, overrides)
+    for w in warnings:
+        print(f"servicenow-mcp: WARNING - {w}", file=sys.stderr)
     return guards
 
 
@@ -435,6 +605,7 @@ BLOCKED_FIELDS = frozenset(_guards["blocked_fields"])
 
 
 def _guard_table(table: str, operation: str):
+    _valid_table(table)
     if table in BLOCKED_TABLES:
         raise PermissionError(
             f"BLOCKED: {operation} on protected table '{table}' is not allowed. "
@@ -445,6 +616,18 @@ def _guard_table(table: str, operation: str):
             f"BLOCKED: create on restricted table '{table}' is not allowed. "
             f"Only updates to {sorted(RESTRICTED_TABLES[table])} are permitted. "
             f"This restriction is enforced at the server level and cannot be overridden."
+        )
+
+
+def _guard_data(data: Any):
+    """Write payloads must be a non-empty object with plain field names."""
+    if not isinstance(data, dict) or not data:
+        raise ValueError("BLOCKED: 'data' must be a non-empty object of field/value pairs.")
+    bad = [k for k in data if not isinstance(k, str) or not _TABLE_RE.fullmatch(k)]
+    if bad:
+        raise ValueError(
+            f"BLOCKED: invalid field names {bad}. Field names may only contain "
+            f"lowercase letters, digits and underscores."
         )
 
 
@@ -463,8 +646,8 @@ def _guard_restricted_fields(table: str, data: dict):
 
 
 def _guard_fields(data: dict):
-    for field in BLOCKED_FIELDS:
-        if field in data:
+    for field in data:
+        if str(field).strip().lower() in BLOCKED_FIELDS:
             raise PermissionError(
                 f"BLOCKED: Cannot modify system field '{field}'. "
                 f"This restriction is enforced at the server level."
@@ -482,60 +665,55 @@ def _guard_no_wipe(data: dict, context: str):
         )
 
 
+def _guard_write(table: str, operation: str, data: Any, context: str):
+    """Every write goes through here, whichever tool it came from."""
+    _guard_table(table, operation)
+    _guard_data(data)
+    _guard_restricted_fields(table, data)
+    _guard_fields(data)
+    if operation == "update":
+        _guard_no_wipe(data, context)
+
+
 def _dispatch(name: str, args: dict) -> Any:
     _require_env()
-    base = _base()
-    h    = _headers()
 
     if name == "sn_query":
         params = {
-            "sysparm_limit": min(int(args.get("limit", 20)), 200),
+            "sysparm_limit": max(1, min(int(args.get("limit", 20)), 200)),
         }
         if args.get("query"):  params["sysparm_query"] = args["query"]
         if args.get("fields"): params["sysparm_fields"] = args["fields"]
-        r = requests.get(f"{base}/api/now/table/{args['table']}", headers=h, params=params)
-        r.raise_for_status()
-        return r.json().get("result", [])
+        return _request("GET", _table_path(args["table"]), params=params) or []
 
     elif name == "sn_get_record":
         params = {}
         if args.get("fields"): params["sysparm_fields"] = args["fields"]
-        r = requests.get(f"{base}/api/now/table/{args['table']}/{args['sys_id']}", headers=h, params=params)
-        r.raise_for_status()
-        return r.json().get("result", {})
+        return _request("GET", _table_path(args["table"], args["sys_id"]), params=params) or {}
 
     elif name == "sn_update_record":
-        _guard_table(args["table"], "update")
-        _guard_restricted_fields(args["table"], args["data"])
-        _guard_fields(args["data"])
-        _guard_no_wipe(args["data"], f"{args['table']}/{args['sys_id']}")
-        r = requests.patch(f"{base}/api/now/table/{args['table']}/{args['sys_id']}",
-                           headers=h, json=args["data"])
-        r.raise_for_status()
+        path = _table_path(args["table"], args["sys_id"])
+        _guard_write(args["table"], "update", args.get("data"), f"{args['table']}/{args['sys_id']}")
+        _request("PATCH", path, json_body=args["data"])
         return {"status": "updated", "sys_id": args["sys_id"]}
 
     elif name == "sn_create_record":
-        _guard_table(args["table"], "create")
-        _guard_fields(args["data"])
-        r = requests.post(f"{base}/api/now/table/{args['table']}", headers=h, json=args["data"])
-        r.raise_for_status()
-        rec = r.json().get("result", {})
+        path = _table_path(args["table"])
+        _guard_write(args["table"], "create", args.get("data"), args["table"])
+        rec = _request("POST", path, json_body=args["data"]) or {}
         return {"status": "created", "sys_id": rec.get("sys_id"), "record": rec}
 
     elif name == "sn_get_widget":
         sys_id = _resolve_widget_sys_id(args["widget_id"])
-        r = requests.get(f"{base}/api/now/table/sp_widget/{sys_id}", headers=h,
-                         params={"sysparm_fields": "name,id,sys_id,template,client_script,script,css"})
-        r.raise_for_status()
-        return r.json().get("result", {})
+        return _request("GET", _table_path("sp_widget", sys_id),
+                        params={"sysparm_fields": "name,id,sys_id,template,client_script,script,css"}) or {}
 
     elif name == "sn_update_widget":
         sys_id = _resolve_widget_sys_id(args["widget_id"])
         payload = {k: v for k, v in args.items()
                    if k in ("template", "client_script", "script", "css", "name") and v is not None}
-        _guard_no_wipe(payload, f"sp_widget/{sys_id}")
-        r = requests.patch(f"{base}/api/now/table/sp_widget/{sys_id}", headers=h, json=payload)
-        r.raise_for_status()
+        _guard_write("sp_widget", "update", payload, f"sp_widget/{sys_id}")
+        _request("PATCH", _table_path("sp_widget", sys_id), json_body=payload)
         return {"status": "updated", "widget_sys_id": sys_id, "fields_updated": list(payload.keys())}
 
     elif name == "sn_list_widgets":
@@ -547,19 +725,15 @@ def _dispatch(name: str, args: dict) -> Any:
             "sysparm_limit": 100,
         }
         if query_parts: params["sysparm_query"] = "^".join(query_parts)
-        r = requests.get(f"{base}/api/now/table/sp_widget", headers=h, params=params)
-        r.raise_for_status()
-        return r.json().get("result", [])
+        return _request("GET", _table_path("sp_widget"), params=params) or []
 
     elif name == "sn_list_pages":
         query_parts = []
         if args.get("scope"):             query_parts.append(f"sys_scope.scope={args['scope']}")
         if args.get("portal_url_suffix"):
-            pr = requests.get(f"{base}/api/now/table/sp_portal", headers=h,
-                               params={"sysparm_query": f"url_suffix={args['portal_url_suffix']}",
-                                       "sysparm_fields": "sys_id", "sysparm_limit": 1})
-            pr.raise_for_status()
-            pres = pr.json().get("result", [])
+            pres = _request("GET", _table_path("sp_portal"),
+                            params={"sysparm_query": f"url_suffix={args['portal_url_suffix']}",
+                                    "sysparm_fields": "sys_id", "sysparm_limit": 1})
             if pres:
                 query_parts.append(f"sp_portal={pres[0]['sys_id']}")
         params = {
@@ -567,42 +741,36 @@ def _dispatch(name: str, args: dict) -> Any:
             "sysparm_limit": 100,
         }
         if query_parts: params["sysparm_query"] = "^".join(query_parts)
-        r = requests.get(f"{base}/api/now/table/sp_page", headers=h, params=params)
-        r.raise_for_status()
-        return r.json().get("result", [])
+        return _request("GET", _table_path("sp_page"), params=params) or []
 
     elif name == "sn_get_page_widgets":
         page_id = args["page_id"]
-        if len(page_id) == 32 and all(c in "0123456789abcdef" for c in page_id):
+        if _is_sys_id(page_id):
             page_sys_id = page_id
         else:
-            pr = requests.get(f"{base}/api/now/table/sp_page", headers=h,
-                               params={"sysparm_query": f"id={page_id}", "sysparm_fields": "sys_id", "sysparm_limit": 1})
-            pr.raise_for_status()
-            pres = pr.json().get("result", [])
+            pres = _request("GET", _table_path("sp_page"),
+                            params={"sysparm_query": f"id={page_id}", "sysparm_fields": "sys_id", "sysparm_limit": 1})
             if not pres: raise ValueError(f"No page found with id='{page_id}'")
             page_sys_id = pres[0]["sys_id"]
 
+        def _children(table: str, query: str, fields: str) -> list:
+            return _request("GET", _table_path(table),
+                            params={"sysparm_query": query, "sysparm_fields": fields, "sysparm_limit": 50}) or []
+
         out = []
-        containers = requests.get(f"{base}/api/now/table/sp_container", headers=h,
-            params={"sysparm_query": f"sp_page={page_sys_id}", "sysparm_fields": "sys_id,title,order", "sysparm_limit": 50})
-        for c in containers.json().get("result", []):
-            rows = requests.get(f"{base}/api/now/table/sp_row", headers=h,
-                params={"sysparm_query": f"sp_container={c['sys_id']}", "sysparm_fields": "sys_id,order", "sysparm_limit": 50})
-            for row in rows.json().get("result", []):
-                cols = requests.get(f"{base}/api/now/table/sp_column", headers=h,
-                    params={"sysparm_query": f"sp_row={row['sys_id']}", "sysparm_fields": "sys_id,order,size_md", "sysparm_limit": 50})
-                for col in cols.json().get("result", []):
-                    instances = requests.get(f"{base}/api/now/table/sp_instance", headers=h,
-                        params={"sysparm_query": f"sp_column={col['sys_id']}", "sysparm_fields": "sys_id,sp_widget,order", "sysparm_limit": 50})
-                    for wi in instances.json().get("result", []):
+        for c in _children("sp_container", f"sp_page={page_sys_id}", "sys_id,title,order"):
+            for row in _children("sp_row", f"sp_container={c['sys_id']}", "sys_id,order"):
+                for col in _children("sp_column", f"sp_row={row['sys_id']}", "sys_id,order,size_md"):
+                    for wi in _children("sp_instance", f"sp_column={col['sys_id']}", "sys_id,sp_widget,order"):
                         widget_ref = wi.get("sp_widget", {})
                         widget_sys_id = widget_ref.get("value", "") if isinstance(widget_ref, dict) else widget_ref
                         widget_info = {}
-                        if widget_sys_id:
-                            wr = requests.get(f"{base}/api/now/table/sp_widget/{widget_sys_id}", headers=h,
-                                params={"sysparm_fields": "name,id,sys_id"})
-                            if wr.ok: widget_info = wr.json().get("result", {})
+                        if _is_sys_id(widget_sys_id):
+                            try:
+                                widget_info = _request("GET", _table_path("sp_widget", widget_sys_id),
+                                                       params={"sysparm_fields": "name,id,sys_id"}) or {}
+                            except RuntimeError:
+                                widget_info = {}  # widget not readable by this user; keep the instance row
                         out.append({
                             "instance_sys_id": wi["sys_id"],
                             "widget_sys_id":   widget_sys_id,
@@ -613,31 +781,31 @@ def _dispatch(name: str, args: dict) -> Any:
 
     elif name == "sn_get_script_include":
         if args.get("sys_id"):
-            r = requests.get(f"{base}/api/now/table/sys_script_include/{args['sys_id']}", headers=h)
+            res = _request("GET", _table_path("sys_script_include", args["sys_id"]))
+        elif args.get("name"):
+            res = _request("GET", _table_path("sys_script_include"),
+                           params={"sysparm_query": f"name={args['name']}", "sysparm_limit": 1})
         else:
-            r = requests.get(f"{base}/api/now/table/sys_script_include", headers=h,
-                params={"sysparm_query": f"name={args.get('name','')}", "sysparm_limit": 1})
-        r.raise_for_status()
-        res = r.json().get("result", {})
+            raise ValueError("Provide either 'name' or 'sys_id'.")
         if isinstance(res, list): res = res[0] if res else {}
-        return res
+        return res or {}
 
     elif name == "sn_update_script_include":
-        _guard_no_wipe({"script": args["script"]}, f"sys_script_include/{args['sys_id']}")
-        r = requests.patch(f"{base}/api/now/table/sys_script_include/{args['sys_id']}",
-                           headers=h, json={"script": args["script"]})
-        r.raise_for_status()
+        path = _table_path("sys_script_include", args["sys_id"])
+        payload = {"script": args["script"]}
+        _guard_write("sys_script_include", "update", payload, f"sys_script_include/{args['sys_id']}")
+        _request("PATCH", path, json_body=payload)
         return {"status": "updated", "sys_id": args["sys_id"]}
 
     elif name == "sn_table_fields":
-        r = requests.get(f"{base}/api/now/table/sys_dictionary", headers=h,
-            params={
-                "sysparm_query": f"name={args['table']}^element!=NULL",
-                "sysparm_fields": "element,column_label,internal_type,default_value",
-                "sysparm_limit": 200,
-            })
-        r.raise_for_status()
-        return sorted(r.json().get("result", []), key=lambda x: x["element"])
+        table = _valid_table(args["table"])
+        res = _request("GET", _table_path("sys_dictionary"),
+                       params={
+                           "sysparm_query": f"name={table}^element!=NULL",
+                           "sysparm_fields": "element,column_label,internal_type,default_value",
+                           "sysparm_limit": 200,
+                       }) or []
+        return sorted(res, key=lambda x: x["element"])
 
     else:
         raise ValueError(f"Unknown tool: {name}")

@@ -1,5 +1,5 @@
 {
-  "_comment": "Table and field safety guards. Ships with safe defaults. Override per-project by placing a guards.json next to your .env file.",
+  "_comment": "Default table and field safety guards. A guards.json next to a project's .env can add restrictions to these but can never remove one.",
 
   "blocked_tables": [
     "sys_security_acl",

@@ -33,7 +33,7 @@ Use `sn_create_record` and `sn_update_record` with these tables:
 | Fix Script | `sys_script_fix` | `name`, `script`, `description` |
 | UI Page | `sys_ui_page` | `name`, `html`, `client_script`, `processing_script` |
 | Notification | `sysevent_email_action` | `name`, `event_name`, `subject`, `message_html`, `active` |
-| ACL | (blocked by default) | Override in guards.json if needed |
+| ACL | (blocked) | `sys_security_acl` is always blocked. Ask the developer to make ACL changes in the ServiceNow UI |
 
 ### Business Rule Example
 ```
@@ -80,20 +80,24 @@ When placing a widget on a Service Portal page, you MUST create the full hierarc
 
 ## Configurable Table Guards
 
-Table access is controlled by `guards.json`. The package ships with safe defaults (blocking ACLs, sys_properties, etc.).
+The server ships with default guards (blocking ACLs, sys_properties, etc.) that cannot be removed.
 
-To customize for your project, create a `guards.json` next to your `.env`:
+A developer can add stricter rules for a project with a `guards.json` next to their `.env`:
 ```json
 {
-  "blocked_tables": ["sys_security_acl", "sys_properties"],
+  "blocked_tables": ["sys_user_has_role"],
   "restricted_tables": {
-    "sys_update_set": ["description"]
+    "sys_user": ["email", "phone"]
   },
-  "blocked_fields": ["sys_id", "sys_created_by", "sys_created_on"]
+  "blocked_fields": ["sys_scope"]
 }
 ```
 
-Only include the sections you want to change — omitted sections keep defaults.
+Entries are added to the defaults. The file can never unblock a default table or field.
+
+**Never create or edit `guards.json` yourself, and never try to work around a `BLOCKED:` error** (different spelling, another tool, another table). If a guard stops a change the developer needs, tell them and let them make it in the ServiceNow UI.
+
+Every write tool shows the developer a confirmation dialog. Before each write, say in plain words which record will change and how, so the dialog is easy to judge.
 
 ## Session End Protocol
 

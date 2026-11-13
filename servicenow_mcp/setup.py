@@ -1,5 +1,5 @@
 """
-servicenow-mcp setup -- installs hooks, skill, and MCP registration into Claude Code.
+servicenow-mcp setup -- installs the skill, write-confirmation rules, and MCP registration into Claude Code.
 Run: servicenow-mcp-setup          (interactive or silent)
 Run: servicenow-mcp-setup --quick  (skip prompts, just register)
 """
@@ -23,8 +23,14 @@ def _load_skill_content() -> str:
     return (_DATA_DIR / "SKILL.md").read_text(encoding="utf-8")
 
 
-def _load_hook_config() -> dict:
-    return json.loads((_DATA_DIR / "hooks.json").read_text(encoding="utf-8"))
+# Write tools that must always show the developer a confirmation prompt.
+WRITE_TOOLS = (
+    "sn_update_record",
+    "sn_create_record",
+    "sn_update_widget",
+    "sn_update_script_include",
+)
+ASK_RULES = [f"mcp__{MCP_KEY}__{tool}" for tool in WRITE_TOOLS]
 
 
 def _claude_dir() -> Path:
@@ -39,39 +45,74 @@ def _install_skill():
     print(f"  Skill installed -> {skill_file}")
 
 
-def _install_hooks():
+def _is_own_legacy_hook(entry: dict) -> bool:
+    """True for hooks installed by earlier versions of this package."""
+    matcher = entry.get("matcher", "")
+    if "sn-legacy-mcp" in matcher:
+        return True
+    if f"mcp__{MCP_KEY}__" not in matcher:
+        return False
+    # Up to v0.2.0 a "prompt" hook was installed. It is evaluated by a model,
+    # never shown to the developer, so it gave no real confirmation.
+    return any(h.get("type") in ("prompt", "confirm") for h in entry.get("hooks", []))
+
+
+def _apply_confirmation_rules(settings: dict) -> tuple[dict, list[str]]:
+    """Add `permissions.ask` rules for every write tool and drop our legacy hook.
+
+    An ask rule makes Claude Code show the developer a confirmation dialog, and
+    it wins over any allow rule. Returns (settings, list of changes made).
+    """
+    changes: list[str] = []
+
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict) and isinstance(hooks.get("PreToolUse"), list):
+        kept = [h for h in hooks["PreToolUse"] if not (isinstance(h, dict) and _is_own_legacy_hook(h))]
+        if len(kept) != len(hooks["PreToolUse"]):
+            changes.append("removed legacy servicenow hook (it never asked a human)")
+            if kept:
+                hooks["PreToolUse"] = kept
+            else:
+                del hooks["PreToolUse"]
+            if not hooks:
+                del settings["hooks"]
+
+    permissions = settings.setdefault("permissions", {})
+    ask = permissions.setdefault("ask", [])
+    for rule in ASK_RULES:
+        if rule not in ask:
+            ask.append(rule)
+            changes.append(f"ask before {rule}")
+
+    return settings, changes
+
+
+def _install_confirmations():
     settings_file = _claude_dir() / "settings.json"
-    hook_config = _load_hook_config()
+    settings: dict = {}
+    if settings_file.exists():
+        try:
+            settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        except ValueError as e:
+            print(f"  WARNING: {settings_file} is not valid JSON ({e}).")
+            print("  Not touching it. Add these rules to permissions.ask by hand:")
+            for rule in ASK_RULES:
+                print(f"    {rule}")
+            return
+        if not isinstance(settings, dict):
+            print(f"  WARNING: {settings_file} has an unexpected shape; not touching it.")
+            return
 
-    if not settings_file.exists():
-        settings_file.parent.mkdir(parents=True, exist_ok=True)
-        settings_file.write_text(json.dumps(hook_config, indent=2), encoding="utf-8")
-        print(f"  Hooks installed -> {settings_file}")
+    settings, changes = _apply_confirmation_rules(settings)
+    if not changes:
+        print("  Confirmation rules already installed -- skipping")
         return
 
-    settings = json.loads(settings_file.read_text(encoding="utf-8"))
-
-    existing_hooks = settings.get("hooks", {})
-    pre_tool = existing_hooks.get("PreToolUse", [])
-
-    matcher = hook_config["hooks"]["PreToolUse"][0]["matcher"]
-
-    # Clean up old/broken hooks (old name or invalid "confirm" type)
-    pre_tool = [h for h in pre_tool
-                if "sn-legacy-mcp" not in h.get("matcher", "")
-                and not any(hook.get("type") == "confirm" for hook in h.get("hooks", []))]
-
-    already = any(h.get("matcher") == matcher for h in pre_tool)
-    if already:
-        print("  Hooks already installed -- skipping")
-        return
-
-    pre_tool.extend(hook_config["hooks"]["PreToolUse"])
-    existing_hooks["PreToolUse"] = pre_tool
-    settings["hooks"] = existing_hooks
-
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
     settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  Hooks installed -> {settings_file}")
+    for change in changes:
+        print(f"  {change}")
+    print(f"  Confirmation rules installed -> {settings_file}")
 
 
 def _find_python() -> str:
@@ -86,25 +127,29 @@ def _install_mcp_server():
     # This is safe to run while Claude Code is open -- no race conditions.
     import subprocess
 
-    # Remove any existing entry first (claude mcp add won't overwrite)
-    subprocess.run(
-        ["claude", "mcp", "remove", MCP_KEY, "-s", "user"],
-        capture_output=True
-    )
+    # shutil.which resolves claude.cmd / claude.exe on Windows; a bare "claude"
+    # passed to subprocess raises FileNotFoundError there instead of failing cleanly.
+    claude = shutil.which("claude")
+    result = None
+    if claude:
+        # Remove any existing entry first (claude mcp add won't overwrite)
+        subprocess.run([claude, "mcp", "remove", MCP_KEY, "-s", "user"], capture_output=True)
+        result = subprocess.run(
+            [claude, "mcp", "add", MCP_KEY, "-s", "user",
+             "--", python_path, "-m", "servicenow_mcp.server"],
+            capture_output=True, text=True
+        )
 
-    result = subprocess.run(
-        ["claude", "mcp", "add", MCP_KEY, "-s", "user",
-         "--", python_path, "-m", "servicenow_mcp.server"],
-        capture_output=True, text=True
-    )
-
-    if result.returncode == 0:
+    if result is not None and result.returncode == 0:
         print(f"  MCP server registered via `claude mcp add`")
         print(f"  Python: {python_path}")
         print(f"  Module: servicenow_mcp.server")
     else:
-        # Fallback: write directly to ~/.claude.json if `claude` CLI not found
-        print(f"  `claude` CLI not found, falling back to direct config write...")
+        if result is None:
+            print(f"  `claude` CLI not found on PATH, falling back to direct config write...")
+        else:
+            print(f"  `claude mcp add` failed ({(result.stderr or '').strip() or 'no output'}),")
+            print(f"  falling back to direct config write...")
         _install_mcp_server_fallback(python_path)
 
     # Clean up old ~/.claude/mcp.json if it exists (wrong location from v0.1)
@@ -246,8 +291,8 @@ def main():
     print("\n  [1/4] Installing /servicenow skill...")
     _install_skill()
 
-    print("\n  [2/4] Installing confirmation hooks...")
-    _install_hooks()
+    print("\n  [2/4] Installing write-confirmation rules...")
+    _install_confirmations()
 
     print("\n  [3/4] Registering MCP server...")
     _install_mcp_server()
