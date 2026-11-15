@@ -37,7 +37,7 @@ Open Claude Code and say:
 
 > Set up the servicenow-mcp for me: https://github.com/R2gers/servicenow-mcp
 
-Claude will install the package, run setup, and help you create the `.env` file.
+Claude will install the package and run setup. Create the `.env` file yourself (or run `servicenow-mcp-setup` in your own terminal) so your password never appears in the chat.
 
 ### Option B: Manual install
 
@@ -119,21 +119,29 @@ Claude receives mandatory rules on every connection:
 - Follow the full **Page > Container > Row > Column > Widget Instance** hierarchy
 - Suggest update set description recaps at session end
 
-### 2. Confirmation hooks
+### 2. Human confirmation on every write
 
-All write operations (`sn_update_*`, `sn_create_*`) trigger a confirmation prompt. You always see what's about to happen.
+Setup adds `permissions.ask` rules to `~/.claude/settings.json` for the four write tools (`sn_update_record`, `sn_create_record`, `sn_update_widget`, `sn_update_script_include`). Claude Code then shows you a confirmation dialog with the exact arguments before each write, and an ask rule wins over any allow rule.
 
-### 3. Server-side guards (cannot be bypassed)
+> Versions up to 0.2.0 installed a `prompt` hook instead. That hook was evaluated by a model and never shown to you. Re-run `servicenow-mcp-setup` to replace it.
 
-Hardcoded in Python. No prompt injection or LLM instruction can override these:
+### 3. Server-side guards
+
+Enforced in Python before any request is sent, so no prompt or LLM instruction can talk the server out of them:
 
 | Guard | Details |
 |-------|---------|
+| **Strict identifiers** | Table names must match `[a-z0-9_]+` and sys_ids must be 32 hex characters, so values like `incident/../sys_properties` are rejected instead of reaching a protected table |
+| **HTTPS only** | Credentials are never sent to a plain `http://` instance URL |
 | **No DELETE** | No delete tool exists. Period. |
 | **Protected tables** | `sys_security_acl`, `sys_properties`, `sys_db_object`, `sys_store_app`, and others |
 | **Restricted tables** | `sys_update_set` -- only the `description` field can be updated (for session recaps) |
 | **Protected fields** | `sys_id`, `sys_created_by`, `sys_created_on`, `sys_mod_count`, `sys_class_name` |
 | **Anti-wipe** | Cannot set any text field to an empty string |
+
+A `guards.json` next to your `.env` can **add** blocked tables, blocked fields and restricted tables for that project. It can never remove a default: the file lives in a folder Claude can write to, so loosening from there is ignored and logged as a warning. See `guards.json.example`.
+
+What the guards do not cover: they limit which tables and fields a write may touch, not what the ServiceNow user is otherwise allowed to do. Use an account with least-privilege roles, and do not point this at production.
 
 <details>
 <summary><strong>What IS allowed</strong></summary>
@@ -169,7 +177,7 @@ Your project folder/
 
 ~/.claude.json            <-- servicenow-mcp registered here (via `claude mcp add`)
 ~/.claude/
-  settings.json           <-- confirmation hooks live here
+  settings.json           <-- permissions.ask rules for write tools live here
   skills/servicenow-mcp/  <-- /servicenow skill installed here
 ```
 
@@ -184,7 +192,7 @@ claude mcp remove servicenow -s user
 pip uninstall servicenow-mcp
 ```
 
-Then remove the hook from `~/.claude/settings.json` and the skill folder `~/.claude/skills/servicenow-mcp/`.
+Then remove the `mcp__servicenow__*` entries from `permissions.ask` in `~/.claude/settings.json` and the skill folder `~/.claude/skills/servicenow-mcp/`.
 
 ---
 

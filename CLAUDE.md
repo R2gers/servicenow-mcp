@@ -23,13 +23,17 @@ servicenow-mcp-setup
 This does three things automatically:
 1. Registers the MCP server via `claude mcp add` (user-level scope)
 2. Installs the `/servicenow` skill to `~/.claude/skills/servicenow-mcp/`
-3. Adds confirmation hooks to `~/.claude/settings.json` for all write operations
+3. Adds `permissions.ask` rules to `~/.claude/settings.json` so every write tool shows the user a confirmation dialog
 
-### Step 3 -- Create the `.env` file
+Run it with `--quick` when you run it for the user: the interactive wizard asks for a password and must be run by the user in their own terminal.
 
-Create a `.env` file in the user's **project folder** (where they run Claude Code). Ask them for:
-- Their ServiceNow instance URL
-- Their username and password
+### Step 3 -- The user creates the `.env` file
+
+**NEVER ask the user for their password, and never write it to a file yourself.** Anything typed in chat is stored in the transcript. Instead, tell the user to do one of these themselves:
+- run `servicenow-mcp-setup` in their own terminal from the project folder (the wizard hides the password as they type), or
+- copy `.env.example` to `.env` in the project folder and fill it in by hand.
+
+The file looks like this:
 
 ```env
 SERVICENOW_INSTANCE_URL=https://yourinstance.service-now.com
@@ -63,14 +67,17 @@ Once the MCP is loaded, 12 tools become available (prefixed `mcp__servicenow__sn
 ```
 servicenow_mcp/
   server.py      Main MCP server (tools, safety guards, dispatch)
-  setup.py       Setup command (skill, hooks, MCP registration)
+  setup.py       Setup command (skill, write-confirmation rules, MCP registration)
   __init__.py
 pyproject.toml   Package config (pip installable)
 test_guards.py   Safety guard tests (run: python test_guards.py)
 ```
 
-## Safety guards (hardcoded in server.py)
+## Safety guards (enforced in server.py)
 
+- Every ServiceNow call goes through `_request()` (timeout, no redirects, ServiceNow's own error text). Do not call `requests` directly.
+- Every write goes through `_guard_write()`. Table names and sys_ids are validated by `_table_path()` before they reach a URL.
+- A project `guards.json` can only add restrictions (`_merge_guards`). Never make it able to loosen the defaults.
 - No delete tool exists
 - Blocked tables: `sys_security_acl`, `sys_properties`, `sys_db_object`, `sys_store_app`, etc.
 - Restricted tables: `sys_update_set` (only `description` can be updated)
