@@ -2,6 +2,7 @@
 servicenow-mcp setup -- installs the skill, write-confirmation rules, and MCP registration into Claude Code.
 Run: servicenow-mcp-setup          (interactive or silent)
 Run: servicenow-mcp-setup --quick  (skip prompts, just register)
+Run: servicenow-mcp-setup --allow-write HOST  (approve one non-production instance for writes)
 """
 
 import json
@@ -267,6 +268,7 @@ def _prompt_env_setup():
         ])
 
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _prompt_write_access(instance_url)
     print(f"\n  .env created -> {env_path}")
 
     gitignore = Path.cwd() / ".gitignore"
@@ -281,7 +283,63 @@ def _prompt_env_setup():
         print("  Created .gitignore with .env")
 
 
+def _prompt_write_access(instance_url: str):
+    """Ask whether Claude may write to this instance. Unapproved instances stay read-only."""
+    from servicenow_mcp import policy
+
+    host = policy.host_of(instance_url)
+    state = policy.resolve(instance_url)
+    print()
+    print("  ── Write access ──")
+    print()
+    if state["mode"] == policy.WRITE:
+        print(f"  Writes are allowed: {state['reason']}")
+        return
+    if state["mode"] == policy.BLOCKED or state["system_policy"]:
+        print(f"  {state['reason']}.")
+        print("  This is set by your organisation's policy and cannot be changed here.")
+        return
+
+    print(f"  {host} is READ-ONLY for Claude until you approve it.")
+    print("  Only approve development, test or sandbox instances. Never production.")
+    print()
+    answer = input(f"  Is {host} a NON-production instance Claude may write to? [y/N]: ").strip().lower()
+    if answer == "y":
+        path = policy.allow_write(host)
+        print(f"  Write access approved -> {path}")
+    else:
+        print("  Keeping it read-only. To approve it later, run:")
+        print(f"    servicenow-mcp-setup --allow-write {host}")
+
+
+def _allow_write_command(argv: list) -> int:
+    """`servicenow-mcp-setup --allow-write HOST` -- approve one instance for writes, nothing else."""
+    from servicenow_mcp import policy
+
+    index = argv.index("--allow-write")
+    if index + 1 >= len(argv):
+        print("  Usage: servicenow-mcp-setup --allow-write yourinstance.service-now.com")
+        return 2
+    host = policy.host_of(argv[index + 1])
+    system, _ = policy.read_policy_file(policy.system_policy_path())
+    if system is not None:
+        print(f"  A system policy is installed at {policy.system_policy_path()}.")
+        print("  It decides which instances are writable; a user approval has no effect.")
+        return 1
+    try:
+        path = policy.allow_write(host)
+    except ValueError as e:
+        print(f"  ERROR: {e}")
+        return 2
+    print(f"  {host} approved for writes -> {path}")
+    print("  Restart Claude Code for this to take effect.")
+    return 0
+
+
 def main():
+    if "--allow-write" in sys.argv:
+        sys.exit(_allow_write_command(sys.argv))
+
     quick = "--quick" in sys.argv
 
     print()
@@ -302,6 +360,9 @@ def main():
         print()
         print("  " + "=" * 40)
         print("  Setup complete! Restart Claude Code.")
+        print()
+        print("  Instances are read-only until approved. To let Claude write to a")
+        print("  NON-production instance, run:  servicenow-mcp-setup --allow-write <host>")
         print()
         print("  Next: create a .env in your project folder:")
         print("    SERVICENOW_INSTANCE_URL=https://yourinstance.service-now.com")

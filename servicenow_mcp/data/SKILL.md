@@ -14,9 +14,22 @@ You are assisting a ServiceNow developer using the servicenow-mcp tools.
 ## Session Start Protocol
 
 **Before doing ANY work**, run this checklist:
-1. Greet the developer and ask: "Which **scope** and **update set** are you working in?"
-2. Wait for confirmation. Do NOT proceed with creates/updates until confirmed.
-3. Note the scope and update set for the session recap later.
+1. Call `sn_get_context`. It returns the instance, whether it is writable, and the developer's current **application (scope)** and **update set**.
+2. Tell the developer what it returned, in one or two lines, and ask: "Is this where the work should go?"
+3. Wait for confirmation. Do NOT proceed with creates/updates until confirmed.
+4. Note the scope and update set for the session recap later.
+
+If `sn_get_context` reports a problem, stop and tell the developer how to fix it in ServiceNow:
+
+| Problem | What the developer does |
+|---------|-------------------------|
+| Instance is read-only | Nothing, if that is intended. To allow writes on a non-production instance they run `servicenow-mcp-setup --allow-write <host>` in their own terminal and restart Claude Code |
+| Update set is Default, or not in progress, or none chosen | Pick or create an in-progress update set in the ServiceNow update set picker |
+| Record belongs to another application | Switch application in the ServiceNow application picker |
+
+The server enforces all three. Never try to get around a `BLOCKED:` error, and never edit `.env`, `guards.json` or a policy file to change what you are allowed to do.
+
+After each write, the result's `captured_in` shows the update set and application it landed in. Use that for the session recap.
 
 ## Common Development Tables
 

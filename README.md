@@ -88,10 +88,11 @@ SERVICENOW_PASSWORD=your_password
 
 ## Tools
 
-12 tools covering the core ServiceNow developer workflow:
+13 tools covering the core ServiceNow developer workflow:
 
 | Tool | What it does |
 |------|-------------|
+| **`sn_get_context`** | Show the instance and whether it is writable, plus your current application (scope) and update set |
 | **`sn_query`** | Query any table with encoded queries, field selection, and limits |
 | **`sn_get_record`** | Fetch a single record by sys_id |
 | **`sn_create_record`** | Create a record in any table |
@@ -109,12 +110,12 @@ SERVICENOW_PASSWORD=your_password
 
 ## Safety
 
-Three layers of protection -- from guidance to hard enforcement:
+Five layers of protection -- from guidance to hard enforcement:
 
 ### 1. MCP Instructions (automatic)
 
 Claude receives mandatory rules on every connection:
-- Verify scope and update set before making changes
+- Call `sn_get_context` and have you confirm the application and update set before making changes
 - Always read before updating
 - Follow the full **Page > Container > Row > Column > Widget Instance** hierarchy
 - Suggest update set description recaps at session end
@@ -125,7 +126,56 @@ Setup adds `permissions.ask` rules to `~/.claude/settings.json` for the four wri
 
 > Versions up to 0.2.0 installed a `prompt` hook instead. That hook was evaluated by a model and never shown to you. Re-run `servicenow-mcp-setup` to replace it.
 
-### 3. Server-side guards
+### 3. Instance policy: read-only unless approved
+
+An instance nobody has vouched for is **read-only**. The write tools are not even offered to Claude, and the server refuses them if called.
+
+| Instance | Default |
+|----------|---------|
+| Personal Developer Instance (`dev12345.service-now.com`) | Writable |
+| Anything else | Read-only until approved |
+| Listed under `blocked_instances` | Refused entirely, reads included |
+
+To approve a **non-production** instance, run this yourself in a terminal (the setup wizard also asks):
+
+```bash
+servicenow-mcp-setup --allow-write yourdev.service-now.com
+```
+
+That writes `~/.servicenow-mcp/policy.json`, outside any project folder. To force read-only for one project, add `SERVICENOW_READ_ONLY=true` to its `.env`.
+
+<details>
+<summary><strong>Organisation-wide policy</strong></summary>
+
+An admin can install a system policy that developers cannot override:
+
+- Windows: `%ProgramData%\servicenow-mcp\policy.json`
+- macOS / Linux: `/etc/servicenow-mcp/policy.json`
+
+```json
+{
+  "write_instances":   ["acmedev.service-now.com", "acme-sbx*.service-now.com"],
+  "blocked_instances": ["acme.service-now.com"]
+}
+```
+
+When this file exists, only the hosts it lists are writable (PDIs included), user approvals are ignored, and blocked hosts cannot be used at all. Entries are host names or globs.
+
+</details>
+
+### 4. Scope and update set check
+
+Before changing configuration (any table captured in update sets), the server reads your current application and update set from your ServiceNow user preferences and refuses the write when:
+
+- your current update set is a **Default** update set, is not in progress, or none is chosen for the application
+- the record belongs to a **different application** than the one you are currently in
+- it cannot read your preferences at all
+
+Successful writes report which update set and application they were captured in. Writes to data tables such as `incident` are not affected. To turn the check off for a project, set `SERVICENOW_UPDATE_SET_CHECK=off` in its `.env`.
+
+> This check reads the same preference records the ServiceNow UI uses. It was built from other tools' source code and tested against a simulated instance, not yet against a live one, so try it on a sandbox first.
+
+### 5. Server-side guards
 
 Enforced in Python before any request is sent, so no prompt or LLM instruction can talk the server out of them:
 
@@ -163,7 +213,7 @@ Full read/write access to:
 
 After setup, type `/servicenow` in Claude Code to activate the guided workflow. It enforces:
 
-1. **Session start** -- asks you to confirm scope and update set
+1. **Session start** -- reads your current scope and update set with `sn_get_context` and asks you to confirm them
 2. **Widget + page creation** -- follows the correct 6-step hierarchy (never skips Container/Row/Column)
 3. **Session end** -- offers to write a recap to your update set description
 

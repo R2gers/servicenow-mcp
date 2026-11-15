@@ -47,13 +47,23 @@ SERVICENOW_PASSWORD=your_password
 - NEVER pass credentials via `-e` flags in the MCP registration. The server reads `.env` at runtime.
 - Do NOT commit this file. It should already be in `.gitignore`.
 
+### Step 3b -- Write access is the user's decision
+
+An instance is read-only until the user approves it (Personal Developer Instances are writable by default). If the user wants Claude to write to a **non-production** instance, tell them to run this in their own terminal:
+
+```bash
+servicenow-mcp-setup --allow-write theirinstance.service-now.com
+```
+
+**NEVER run that command yourself, and never create or edit `~/.servicenow-mcp/policy.json`, the system policy file, or `SERVICENOW_READ_ONLY` / `SERVICENOW_UPDATE_SET_CHECK` in `.env`.** Those are how the user tells the server what Claude may do.
+
 ### Step 4 -- Restart Claude Code
 
 Tell the user: "Restart Claude Code for the MCP server to load. After restart, I'll have access to ServiceNow tools."
 
 ## After setup
 
-Once the MCP is loaded, 12 tools become available (prefixed `mcp__servicenow__sn_*`). The `/servicenow` slash command activates the guided workflow.
+Once the MCP is loaded, 13 tools become available on a writable instance (9 on a read-only one) (prefixed `mcp__servicenow__sn_*`). The `/servicenow` slash command activates the guided workflow.
 
 ## Troubleshooting
 
@@ -68,6 +78,7 @@ Once the MCP is loaded, 12 tools become available (prefixed `mcp__servicenow__sn
 servicenow_mcp/
   server.py      Main MCP server (tools, safety guards, dispatch)
   setup.py       Setup command (skill, write-confirmation rules, MCP registration)
+  policy.py      Instance policy (writable / read-only / blocked)
   __init__.py
 pyproject.toml   Package config (pip installable)
 test_guards.py   Safety guard tests (run: python test_guards.py)
@@ -78,6 +89,8 @@ test_guards.py   Safety guard tests (run: python test_guards.py)
 - Every ServiceNow call goes through `_request()` (timeout, no redirects, ServiceNow's own error text). Do not call `requests` directly.
 - Every write goes through `_guard_write()`. Table names and sys_ids are validated by `_table_path()` before they reach a URL.
 - A project `guards.json` can only add restrictions (`_merge_guards`). Never make it able to loosen the defaults.
+- `policy.py` decides whether an instance is writable, read-only or blocked, from files outside the project folder. Unapproved instances are read-only. Every new write tool must be added to `WRITE_TOOLS` in `server.py` and `setup.py`.
+- Every write to a table captured in update sets goes through `_guard_capture()`: refused in a Default / not-in-progress update set, or when the record belongs to another application.
 - No delete tool exists
 - Blocked tables: `sys_security_acl`, `sys_properties`, `sys_db_object`, `sys_store_app`, etc.
 - Restricted tables: `sys_update_set` (only `description` can be updated)

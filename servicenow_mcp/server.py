@@ -22,6 +22,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from servicenow_mcp import policy
+
 
 _env_loaded = False
 _env_error = None  # type: str | None
@@ -104,6 +106,8 @@ def _load_env():
     _env_loaded = True
     print(f"servicenow-mcp: loaded credentials from {env_file}", file=sys.stderr)
     print(f"servicenow-mcp: target instance -> {os.environ['SERVICENOW_INSTANCE_URL']}", file=sys.stderr)
+    p = _policy()
+    print(f"servicenow-mcp: access mode -> {p['mode']} ({p['reason']})", file=sys.stderr)
 
 
 def _require_env():
@@ -112,6 +116,46 @@ def _require_env():
         raise RuntimeError(
             f"ServiceNow credentials not configured. {_env_error or ''}\n"
             f"Create a .env file in your project folder and restart Claude Code."
+        )
+
+
+# ── Instance policy ─────────────────────────────────────────────────────────
+# Which instance may be written to is decided by servicenow_mcp/policy.py from
+# files OUTSIDE the project folder. An instance nobody approved is read-only.
+
+WRITE_TOOLS = frozenset({
+    "sn_update_record",
+    "sn_create_record",
+    "sn_update_widget",
+    "sn_update_script_include",
+})
+
+_instance_policy = None  # type: dict | None
+
+
+def _policy() -> dict:
+    global _instance_policy
+    if _instance_policy is None:
+        _instance_policy = policy.resolve(
+            os.environ.get("SERVICENOW_INSTANCE_URL", ""),
+            os.environ.get("SERVICENOW_READ_ONLY"),
+        )
+    return _instance_policy
+
+
+def _guard_instance(tool: str):
+    """Refuse everything on a blocked instance, and writes on a read-only one."""
+    p = _policy()
+    if p["mode"] == policy.BLOCKED:
+        raise PermissionError(
+            f"BLOCKED: this instance may not be used with servicenow-mcp: {p['reason']}. "
+            f"This is enforced at the server level. Do not try to work around it."
+        )
+    if tool in WRITE_TOOLS and p["mode"] != policy.WRITE:
+        raise PermissionError(
+            f"BLOCKED: {tool} is not available because this instance is read-only: {p['reason']}. "
+            f"This is enforced at the server level. Do not edit policy files or .env to change it; "
+            f"tell the developer and let them decide."
         )
 
 
@@ -181,9 +225,12 @@ SERVER_INSTRUCTIONS = """
 
 ### Session Start Checklist
 At the START of every session that will use ServiceNow tools:
-1. Ask the developer to confirm their **current scope** and **active update set** before making any changes.
-2. Remind them: "Please verify your scope and update set in ServiceNow before we begin."
+1. Call `sn_get_context`. It reports the instance, whether it is writable, and the developer's current **application (scope)** and **update set**.
+2. Tell the developer what it returned and ask them to confirm that is where the work should go.
 3. Do NOT proceed with any create/update operations until the developer confirms.
+4. If it reports problems (Default update set, update set not in progress, read-only instance), tell the developer and let them fix it in ServiceNow. Never try to work around a `BLOCKED:` error, and never edit `.env`, `guards.json` or policy files yourself.
+
+The server enforces this too: configuration writes are refused when they would land in a Default update set or in a different application than the record belongs to.
 
 ### Service Portal Page + Widget Creation (CRITICAL)
 When placing a widget on a Service Portal page, you MUST create the full hierarchy:
@@ -229,7 +276,25 @@ server = Server("servicenow-mcp", instructions=SERVER_INSTRUCTIONS)
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
+    tools = _all_tools()
+    # On a read-only or blocked instance the write tools are not even offered.
+    if _env_loaded and _policy()["mode"] != policy.WRITE:
+        tools = [t for t in tools if t.name not in WRITE_TOOLS]
+    return tools
+
+
+def _all_tools() -> list[Tool]:
     return [
+        Tool(
+            name="sn_get_context",
+            description=(
+                "Read-only. Returns where changes will land: the instance and whether it is writable, "
+                "the API user, their current application (scope) and current update set, and any problem "
+                "that would block configuration writes (e.g. the update set is Default or not in progress). "
+                "Call this at the start of a session and before the first write."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
         Tool(
             name="sn_query",
             description=(
@@ -675,10 +740,228 @@ def _guard_write(table: str, operation: str, data: Any, context: str):
         _guard_no_wipe(data, context)
 
 
+# ── Scope and update set context ─────────────────────────────────────────────
+# ServiceNow stores a developer's current application and update set as rows
+# in sys_user_preference. A Table API call starts a fresh session that reads
+# those rows, so they decide where a configuration change is captured:
+#
+#   apps.current_app               -> sys_id of the application, or "global"
+#   updateSetForScope<app sys_id>  -> sys_id of the update set chosen for that app
+#   sys_update_set                 -> sys_id of the last update set chosen
+#
+# Reading the rows through the Table API has no side effects. (The UI's own
+# /api/now/ui/concoursepicker/current endpoint can rewrite preferences and
+# create Default update sets, so it is deliberately not used here.)
+
+GLOBAL_SCOPE = "global"
+
+_user_cache: dict = {}
+_captured_cache: dict = {}
+
+
+def _ref_value(value: Any) -> str:
+    """Reference fields come back as {'link':..., 'value':...} or as a bare string."""
+    if isinstance(value, dict):
+        return str(value.get("value") or "")
+    return str(value or "")
+
+
+def _is_true(value: Any) -> bool:
+    return str(value).strip().lower() in ("true", "1")
+
+
+def _current_user() -> dict:
+    if not _user_cache:
+        username = os.environ["SERVICENOW_USERNAME"]
+        rows = _request("GET", _table_path("sys_user"),
+                        params={"sysparm_query": f"user_name={username}",
+                                "sysparm_fields": "sys_id,user_name,name", "sysparm_limit": 1})
+        if not rows:
+            raise RuntimeError(
+                f"Could not read the sys_user record for '{username}', so the current "
+                f"application and update set cannot be determined."
+            )
+        _user_cache.update(rows[0])
+    return dict(_user_cache)
+
+
+def _is_default_update_set(update_set: dict) -> bool:
+    if _is_true(update_set.get("is_default")):
+        return True
+    # Backstop for the name: ServiceNow names them "Default", "Default 1", ...
+    name = str(update_set.get("name") or "").strip().lower()
+    return name == "default" or (name.startswith("default ") and name[8:].strip().isdigit())
+
+
+def _get_context() -> dict:
+    """Read the API user's current application and update set. Always fetched fresh."""
+    user = _current_user()
+    prefs = _request("GET", _table_path("sys_user_preference"),
+                     params={"sysparm_query": (f"user={user['sys_id']}^name=apps.current_app"
+                                               f"^ORname=sys_update_set^ORnameSTARTSWITHupdateSetForScope"),
+                             "sysparm_fields": "name,value", "sysparm_limit": 200}) or []
+    pref = {p.get("name"): str(p.get("value") or "").strip() for p in prefs}
+
+    app_id = pref.get("apps.current_app") or GLOBAL_SCOPE
+    application = {"sys_id": app_id, "name": "Global", "scope": GLOBAL_SCOPE}
+    if app_id != GLOBAL_SCOPE:
+        if not _is_sys_id(app_id):
+            raise RuntimeError(f"Unexpected value for the apps.current_app preference: {app_id!r}")
+        app = _request("GET", _table_path("sys_scope", app_id),
+                       params={"sysparm_fields": "name,scope"}) or {}
+        application.update(name=app.get("name") or app_id, scope=app.get("scope") or "")
+
+    problems: list[str] = []
+    update_set: dict = {}
+    source = f"updateSetForScope{app_id}"
+    us_id = pref.get(source)
+    if not us_id:
+        source, us_id = "sys_update_set", pref.get("sys_update_set")
+
+    if us_id and _is_sys_id(us_id):
+        row = _request("GET", _table_path("sys_update_set", us_id),
+                       params={"sysparm_fields": "sys_id,name,state,is_default,application"}) or {}
+        if row:
+            update_set = {
+                "sys_id": row.get("sys_id") or us_id,
+                "name": row.get("name") or "",
+                "state": str(row.get("state") or "").lower(),
+                "is_default": _is_default_update_set(row),
+                "application": _ref_value(row.get("application")),
+                "from_preference": source,
+            }
+            # The fallback preference may point at a set that belongs to another application.
+            if source == "sys_update_set" and update_set["application"] not in ("", app_id):
+                problems.append(
+                    f"No update set has been chosen for application '{application['name']}'. "
+                    f"ServiceNow will capture changes in that application's Default update set."
+                )
+                update_set = {}
+    if not update_set and not problems:
+        problems.append(
+            f"No update set has been chosen for application '{application['name']}'. "
+            f"ServiceNow will capture changes in its Default update set."
+        )
+    if update_set:
+        if update_set["is_default"]:
+            problems.append(f"The current update set '{update_set['name']}' is a Default update set.")
+        if update_set["state"] != "in progress":
+            problems.append(
+                f"The current update set '{update_set['name']}' is '{update_set['state']}', not in progress. "
+                f"ServiceNow will capture changes in the Default update set instead."
+            )
+
+    return {
+        "user": {"sys_id": user.get("sys_id"), "user_name": user.get("user_name"), "name": user.get("name")},
+        "application": application,
+        "update_set": update_set or None,
+        "config_writes_ok": not problems,
+        "problems": problems,
+    }
+
+
+def _update_set_check_enabled() -> bool:
+    return os.environ.get("SERVICENOW_UPDATE_SET_CHECK", "on").strip().lower() not in ("off", "false", "0", "no")
+
+
+def _is_captured(table: str) -> bool:
+    """True when changes to this table are captured in update sets.
+
+    A table is captured when it extends sys_metadata, or when it (or a parent)
+    has the update_synch dictionary attribute. If this cannot be worked out,
+    the table is treated as captured so the check errs on the safe side.
+    """
+    if table in _captured_cache:
+        return _captured_cache[table]
+    chain: list[str] = []
+    name = table
+    try:
+        for _ in range(12):
+            rows = _request("GET", _table_path("sys_db_object"),
+                            params={"sysparm_query": f"name={name}",
+                                    "sysparm_fields": "name,super_class.name", "sysparm_limit": 1})
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                break
+            chain.append(name)
+            parent = str(rows[0].get("super_class.name") or "").strip()
+            if not parent or parent in chain or not _TABLE_RE.fullmatch(parent):
+                break
+            name = parent
+        if not chain:
+            return True  # unknown table (or hidden by ACL): assume captured, do not cache
+        captured = "sys_metadata" in chain
+        if not captured:
+            rows = _request("GET", _table_path("sys_dictionary"),
+                            params={"sysparm_query": (f"nameIN{','.join(chain)}^internal_type=collection"
+                                                      f"^attributesLIKEupdate_synch=true"),
+                                    "sysparm_fields": "name", "sysparm_limit": 1})
+            captured = bool(rows)
+    except RuntimeError:
+        return True
+    _captured_cache[table] = captured
+    return captured
+
+
+_HOW_TO_DISABLE = (
+    "This check is enforced at the server level. Do not work around it: ask the developer to fix it "
+    "in ServiceNow. (A developer who really wants it off can set SERVICENOW_UPDATE_SET_CHECK=off in .env.)"
+)
+
+
+def _guard_capture(table: str, sys_id: str | None = None) -> dict:
+    """Before a configuration write: make sure it will land in a real update set.
+
+    Returns details to include in the tool result, or {} when the table is not captured.
+    """
+    if not _update_set_check_enabled() or not _is_captured(table):
+        return {}
+    try:
+        ctx = _get_context()
+    except RuntimeError as e:
+        raise PermissionError(
+            f"BLOCKED: could not verify the current application and update set before writing to "
+            f"'{table}' ({e}). {_HOW_TO_DISABLE}"
+        ) from None
+
+    app = ctx["application"]
+    if sys_id is not None:
+        rec = _request("GET", _table_path(table, sys_id), params={"sysparm_fields": "sys_scope"}) or {}
+        rec_scope = _ref_value(rec.get("sys_scope"))
+        if rec_scope and rec_scope != app["sys_id"]:
+            raise PermissionError(
+                f"BLOCKED: this {table} record belongs to a different application (sys_scope {rec_scope}) "
+                f"than the developer's current application '{app['name']}' ({app['sys_id']}). "
+                f"Ask the developer to switch application in ServiceNow first. {_HOW_TO_DISABLE}"
+            )
+    if not ctx["config_writes_ok"]:
+        raise PermissionError(
+            f"BLOCKED: refusing to change '{table}' because the change would not be captured in a "
+            f"proper update set. {' '.join(ctx['problems'])} Ask the developer to select an "
+            f"in-progress, non-Default update set for application '{app['name']}'. {_HOW_TO_DISABLE}"
+        )
+    return {
+        "captured_in": {
+            "update_set": ctx["update_set"]["name"],
+            "update_set_sys_id": ctx["update_set"]["sys_id"],
+            "application": app["name"],
+        }
+    }
+
+
 def _dispatch(name: str, args: dict) -> Any:
     _require_env()
+    _guard_instance(name)
 
-    if name == "sn_query":
+    if name == "sn_get_context":
+        p = _policy()
+        ctx = _get_context()
+        return {
+            "instance": {"host": p["host"], "access_mode": p["mode"], "access_reason": p["reason"]},
+            **ctx,
+            "update_set_check": "on" if _update_set_check_enabled() else "off",
+        }
+
+    elif name == "sn_query":
         params = {
             "sysparm_limit": max(1, min(int(args.get("limit", 20)), 200)),
         }
@@ -694,14 +977,16 @@ def _dispatch(name: str, args: dict) -> Any:
     elif name == "sn_update_record":
         path = _table_path(args["table"], args["sys_id"])
         _guard_write(args["table"], "update", args.get("data"), f"{args['table']}/{args['sys_id']}")
+        info = _guard_capture(args["table"], args["sys_id"])
         _request("PATCH", path, json_body=args["data"])
-        return {"status": "updated", "sys_id": args["sys_id"]}
+        return {"status": "updated", "sys_id": args["sys_id"], **info}
 
     elif name == "sn_create_record":
         path = _table_path(args["table"])
         _guard_write(args["table"], "create", args.get("data"), args["table"])
+        info = _guard_capture(args["table"])
         rec = _request("POST", path, json_body=args["data"]) or {}
-        return {"status": "created", "sys_id": rec.get("sys_id"), "record": rec}
+        return {"status": "created", "sys_id": rec.get("sys_id"), **info, "record": rec}
 
     elif name == "sn_get_widget":
         sys_id = _resolve_widget_sys_id(args["widget_id"])
@@ -713,8 +998,9 @@ def _dispatch(name: str, args: dict) -> Any:
         payload = {k: v for k, v in args.items()
                    if k in ("template", "client_script", "script", "css", "name") and v is not None}
         _guard_write("sp_widget", "update", payload, f"sp_widget/{sys_id}")
+        info = _guard_capture("sp_widget", sys_id)
         _request("PATCH", _table_path("sp_widget", sys_id), json_body=payload)
-        return {"status": "updated", "widget_sys_id": sys_id, "fields_updated": list(payload.keys())}
+        return {"status": "updated", "widget_sys_id": sys_id, "fields_updated": list(payload.keys()), **info}
 
     elif name == "sn_list_widgets":
         query_parts = []
@@ -794,8 +1080,9 @@ def _dispatch(name: str, args: dict) -> Any:
         path = _table_path("sys_script_include", args["sys_id"])
         payload = {"script": args["script"]}
         _guard_write("sys_script_include", "update", payload, f"sys_script_include/{args['sys_id']}")
+        info = _guard_capture("sys_script_include", args["sys_id"])
         _request("PATCH", path, json_body=payload)
-        return {"status": "updated", "sys_id": args["sys_id"]}
+        return {"status": "updated", "sys_id": args["sys_id"], **info}
 
     elif name == "sn_table_fields":
         table = _valid_table(args["table"])
