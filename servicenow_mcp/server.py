@@ -91,7 +91,8 @@ def _load_env():
         print("servicenow-mcp: Server will start but tools will return errors until .env is configured.", file=sys.stderr)
         return
 
-    load_dotenv(dotenv_path=env_file, override=True)
+    # interpolate=False: a password containing "${...}" must be read as written.
+    load_dotenv(dotenv_path=env_file, override=True, interpolate=False)
 
     required = ["SERVICENOW_INSTANCE_URL", "SERVICENOW_USERNAME", "SERVICENOW_PASSWORD"]
     missing = [v for v in required if not os.environ.get(v)]

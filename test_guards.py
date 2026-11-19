@@ -557,6 +557,34 @@ for name, expected in [("Default", True), ("Default 1", True), ("default 12", Tr
           srv._is_default_update_set({"name": name, "is_default": "false"}) is expected)
 check("is_default flag wins over the name", srv._is_default_update_set({"name": "Anything", "is_default": "true"}))
 
+print("\n--- Connection check (doctor) ---")
+from servicenow_mcp import doctor
+
+use_instance(GOOD_PREFS)
+srv._instance_policy = dict(WRITABLE)
+out = doctor.report(load_env=False)
+check("Doctor reports a working connection", out["ok"] and out["user"] == "u" and out["access_mode"] == "write", str(out))
+check("Doctor only reads", all(c["method"] == "GET" for c in calls), str(calls))
+check("Doctor output holds no password", "SERVICENOW_PASSWORD" not in str(out) and srv.os.environ["SERVICENOW_PASSWORD"] not in out.values(), str(out))
+
+inst = use_instance(GOOD_PREFS)
+inst.fail_tables = {"sys_user"}
+out = doctor.report(load_env=False)
+check("Doctor reports ServiceNow's own error", not out["ok"] and "HTTP 403" in out["error"], str(out))
+
+srv._instance_policy = {"host": "prod.example", "mode": "blocked", "reason": "blocked by policy", "system_policy": True}
+use_instance(GOOD_PREFS)
+out = doctor.report(load_env=False)
+check("Doctor makes no request to a blocked instance", not out["ok"] and not calls, str(out))
+srv._instance_policy = dict(WRITABLE)
+
+srv._env_loaded = False
+srv._env_error = "No .env file found"
+out = doctor.report(load_env=False)
+check("Doctor reports a missing .env", not out["ok"] and ".env" in out["error"], str(out))
+srv._env_loaded = True
+srv._env_error = None
+
 print("\n" + "=" * 60)
 print(f"Results: {passed} passed, {failed} failed")
 if failed:

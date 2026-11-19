@@ -79,6 +79,7 @@ servicenow_mcp/
   server.py      Main MCP server (tools, safety guards, dispatch)
   setup.py       Setup command (skill, write-confirmation rules, MCP registration)
   policy.py      Instance policy (writable / read-only / blocked)
+  doctor.py      Connection check (run: python -m servicenow_mcp.doctor --env-file PATH), prints JSON, never credentials
   __init__.py
 pyproject.toml   Package config (pip installable)
 test_guards.py   Safety guard tests (run: python test_guards.py)
