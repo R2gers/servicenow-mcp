@@ -57,6 +57,18 @@ Restart Claude Code after setup.
 
 > **Tip:** If `pip3` is not found, try `python3 -m pip install ...` instead.
 
+### Option C: The plugin (no terminal, no hand-written `.env`)
+
+This repository is also a Claude Code plugin marketplace. The `servicenow-instances` plugin adds a pane that installs the server, creates a folder and `.env` for each instance from a form, and tests the connection.
+
+In the Claude desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `R2gers/servicenow-mcp`, then **Add plugin**. In a terminal session:
+
+```
+/plugin install servicenow-instances --marketplace R2gers/servicenow-mcp
+```
+
+Then type `/servicenow-instances`. It needs a recent Claude Code and Python 3.10+. See [plugins/servicenow-instances](plugins/servicenow-instances/README.md).
+
 ### Configure your instance
 
 Create a `.env` file in your **project folder** (where you run Claude Code):

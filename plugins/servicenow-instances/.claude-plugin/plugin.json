@@ -1,0 +1,9 @@
+{
+  "name": "servicenow-instances",
+  "version": "0.1.0",
+  "description": "A pane to add ServiceNow instances for servicenow-mcp: it creates each instance folder and its .env, and tests the connection.",
+  "author": { "name": "R2gers" },
+  "license": "MIT",
+  "homepage": "https://github.com/R2gers/servicenow-mcp",
+  "types": "./types/index.d.ts"
+}

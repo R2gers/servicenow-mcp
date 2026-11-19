@@ -1,0 +1,11 @@
+{
+  "name": "servicenow-mcp",
+  "owner": { "name": "R2gers" },
+  "plugins": [
+    {
+      "name": "servicenow-instances",
+      "source": "./plugins/servicenow-instances",
+      "description": "A pane to add ServiceNow instances for servicenow-mcp: it creates each instance folder and its .env, and tests the connection."
+    }
+  ]
+}
