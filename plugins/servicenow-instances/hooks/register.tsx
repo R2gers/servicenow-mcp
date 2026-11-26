@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Check, Instance, Server, View } from '../types'
+import type { Check, Instance, Nav, Server, View } from '../types'
 
 const PANE = 'servicenow-instances'
 const TITLE = 'ServiceNow instances'
@@ -9,12 +9,29 @@ const TITLE = 'ServiceNow instances'
 const PACKAGE =
   'https://github.com/R2gers/servicenow-mcp/archive/refs/heads/master.zip'
 const VERSION_CODE = 'import servicenow_mcp; print(servicenow_mcp.__version__)'
+const SETUP_CHECK_CODE =
+  'import json; from servicenow_mcp import setup; print(json.dumps(setup.check()))'
 const PYTHONS = ['python', 'python3', 'py']
 const NO_INSTANCES: Instance[] = []
 const NO_CHECKS: Record<string, Check> = {}
 const LIST_VIEW: View = { mode: 'list', auth: 'basic', gen: 0, message: '' }
 const UNKNOWN_SERVER: Server = { status: 'unknown', python: '', text: '' }
+const LIST_SCREEN: Nav = { screen: 'list', name: '' }
+// A longer list is searched, not scrolled.
+const MAX_ROWS = 40
+// Up to this many show as whole cards; more show one line each.
+const OPEN_CARDS = 6
 
+// The name of the instance whose Allow writes press awaits its confirmation.
+const confirm = atom(
+  { plugin: 'servicenow-instances', key: 'confirm' } as const,
+  '',
+)
+const nav = atom(
+  { plugin: 'servicenow-instances', key: 'nav' } as const,
+  LIST_SCREEN,
+)
+const query = atom({ plugin: 'servicenow-instances', key: 'query' } as const, '')
 const server = atom(
   { plugin: 'servicenow-instances', key: 'server' } as const,
   UNKNOWN_SERVER,
@@ -32,6 +49,15 @@ const view = atom(
   { plugin: 'servicenow-instances', key: 'view' } as const,
   LIST_VIEW,
 )
+
+// A press is given ten seconds and a command can take longer, and work a press
+// leaves running is dropped with it: such work is handed to a timer, which the
+// engine runs once the press has returned.
+const later = ($: EngineInterface, work: () => Promise<unknown>) => {
+  $.clock.after(0, () => {
+    void work().catch(() => undefined)
+  })
+}
 
 const sepOf = (path: string) => (path.includes('\\') ? '\\' : '/')
 const join = (dir: string, name: string) =>
@@ -115,6 +141,25 @@ const findBase = async ($: EngineInterface) => {
   return join(home, 'ServiceNow')
 }
 
+const setupProblems = (stdout: string): string[] | undefined => {
+  const line = stdout
+    .split(/\r?\n/)
+    .reverse()
+    .find(one => one.trim().startsWith('{'))
+  if (line === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(line)
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    if (!('problems' in parsed) || !Array.isArray(parsed.problems)) {
+      return undefined
+    }
+
+    return parsed.problems.map(String)
+  } catch {
+    return undefined
+  }
+}
+
 const findServer = async ($: EngineInterface): Promise<Server> => {
   let python = ''
 
@@ -125,6 +170,19 @@ const findServer = async ($: EngineInterface): Promise<Server> => {
     if (ran === undefined) continue
     const version = ran.stdout.trim()
     if (ran.exitCode === 0 && /^\d+(\.\d+)+$/.test(version)) {
+      // Reads only. An older server has no such check and answers nothing.
+      const checked = await $.process
+        .run([exe, '-c', SETUP_CHECK_CODE], { timeoutMs: 20000 })
+        .catch(() => undefined)
+      const problems = setupProblems(checked?.stdout ?? '')
+      if (problems !== undefined && problems.length > 0) {
+        return {
+          status: 'needs-setup',
+          python: exe,
+          text: `Setup is incomplete. ${problems.join(' ')}`,
+        }
+      }
+
       return {
         status: 'installed',
         python: exe,
@@ -186,6 +244,32 @@ const install = async ($: EngineInterface) => {
       ? 'Restart Claude Code to load it.'
       : 'Its setup did not finish: run servicenow-mcp-setup --quick in a terminal.'
   await update($, server, () => ({ ...found, text: `${found.text} ${note}` }))
+  await say($, `Server installed. ${note}`)
+}
+
+// Run only by the person's press on Finish setup: the server's own setup
+// installs the write confirmations, the skill and the MCP registration, and
+// keeps the settings file as it was beside it.
+const finishSetup = async ($: EngineInterface) => {
+  const before = await read($, server)
+  if (before.status !== 'needs-setup') return
+  const exe = before.python
+  await update($, server, () => ({
+    status: 'installing' as const,
+    python: exe,
+    text: 'Finishing setup...',
+  }))
+  const ran = await $.process
+    .run([exe, '-m', 'servicenow_mcp.setup', '--quick'], { timeoutMs: 120000 })
+    .catch(() => undefined)
+  const found = await findServer($)
+  await update($, server, () => found)
+  await say(
+    $,
+    ran?.exitCode === 0 && found.status === 'installed'
+      ? 'Setup finished. Restart any open ServiceNow session for it to take effect. Your previous Claude settings were kept as settings.json.before-servicenow-mcp.'
+      : 'Setup did not finish: run servicenow-mcp-setup --quick in a terminal.',
+  )
 }
 
 const refresh = async ($: EngineInterface) => {
@@ -193,10 +277,14 @@ const refresh = async ($: EngineInterface) => {
   await update($, base, () => dir)
   const found = await scan($, dir)
   await update($, instances, () => found)
-  const { status } = await read($, server)
-  if (status === 'installing') return
   const current = await findServer($)
   await update($, server, () => current)
+}
+
+const useBase = async ($: EngineInterface, dir: string) => {
+  await $.store.set('base', dir)
+  await update($, base, () => dir)
+  await refresh($)
 }
 
 const say = ($: EngineInterface, message: string) =>
@@ -225,17 +313,59 @@ const reportOf = (stdout: string): Report | undefined => {
 
 const describe = (report: Report): Check => {
   if (report.ok !== true) {
-    const error = (report.error ?? 'The check failed.').slice(0, 400)
+    const error = (report.error ?? 'The check failed.').slice(0, 900)
 
     return { ok: false, isRunning: false, text: `Not connected: ${error}` }
   }
   const who = `Connected as ${report.user ?? 'the API user'}.`
-  const access =
-    report.access_mode === 'write'
-      ? 'Claude may write to this instance.'
-      : `Read-only for Claude. To allow writes on a NON-production instance, run in your own terminal: servicenow-mcp-setup --allow-write ${report.host ?? '<host>'}`
+  if (report.access_mode === 'write') {
+    const text = `${who} Claude may write to this instance.`
 
-  return { ok: true, isRunning: false, text: `${who} ${access}` }
+    return { ok: true, isRunning: false, text, access: 'write' }
+  }
+  const text = `${who} Read-only for Claude.`
+  const access = 'read-only' as const
+
+  return report.host === undefined || report.host === ''
+    ? { ok: true, isRunning: false, text, access }
+    : { ok: true, isRunning: false, text, access, allowHost: report.host }
+}
+
+const markOf = (result: Check | undefined) =>
+  result === undefined ? '○' : result.isRunning ? '…' : '●'
+const colorOf = (result: Check | undefined) =>
+  result === undefined || result.isRunning
+    ? undefined
+    : result.ok
+      ? 'green'
+      : 'red'
+const tagOf = (result: Check | undefined) => {
+  if (result === undefined) return 'not tested'
+  if (result.isRunning) return 'checking'
+  if (!result.ok) return 'not connected'
+  if (result.access === 'write') return 'writable'
+
+  // A result an earlier version stored says nothing of access: claim nothing.
+  return result.access === 'read-only' || result.allowHost !== undefined
+    ? 'read-only'
+    : 'connected'
+}
+const tagColorOf = (tag: string) =>
+  tag === 'writable' || tag === 'connected'
+    ? 'green'
+    : tag === 'read-only'
+      ? 'yellow'
+      : tag === 'not connected'
+        ? 'red'
+        : undefined
+const hostOf = (url: string) =>
+  url.replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+
+// Leaving a screen drops a half-given confirmation and the last message.
+const goTo = async ($: EngineInterface, screen: Nav['screen'], name: string) => {
+  await update($, confirm, () => '')
+  await update($, view, now => ({ ...now, message: '' }))
+  await update($, nav, () => ({ screen, name }))
 }
 
 const doctor = async ($: EngineInterface, one: Instance): Promise<Check> => {
@@ -277,6 +407,114 @@ const runCheck = async ($: EngineInterface, one: Instance) => {
   await update($, checks, all => ({ ...all, [one.name]: running }))
   const result = await doctor($, one)
   await update($, checks, all => ({ ...all, [one.name]: result }))
+}
+
+// Pressing a card's name opens it, and pressing the open one closes it.
+const toggle = async ($: EngineInterface, name: string) => {
+  const { name: open } = await read($, nav)
+  await goTo($, 'list', open === name ? '' : name)
+}
+
+// One after another: a row's mark fills in as its answer comes.
+const testAll = async ($: EngineInterface, list: readonly Instance[]) => {
+  for (const one of list) {
+    await runCheck($, one)
+  }
+}
+
+// Run only by the person's second press, on the confirmation: it has the
+// server's own setup command record the approval, so an organisation's policy
+// still decides where one is installed. The model has no way to reach it.
+const allowWrites = async ($: EngineInterface, one: Instance, host: string) => {
+  await update($, confirm, () => '')
+  const { python } = await read($, server)
+  const exe = python === '' ? 'python' : python
+  const ran = await $.process
+    .run([exe, '-m', 'servicenow_mcp.setup', '--allow-write', host], {
+      timeoutMs: 60000,
+    })
+    .catch(() => undefined)
+  if (ran?.exitCode !== 0) {
+    const why = lastLine(ran?.stdout) || lastLine(ran?.stderr)
+    const failed: Check = {
+      ok: false,
+      isRunning: false,
+      text: `Writes were not allowed. ${why}`,
+    }
+    await update($, checks, all => ({ ...all, [one.name]: failed }))
+
+    return
+  }
+  await runCheck($, one)
+  await say(
+    $,
+    `Writes allowed on ${host}. Restart any session already open on that instance.`,
+  )
+}
+
+const textOf = (content: unknown) =>
+  Array.isArray(content)
+    ? content
+        .map((block: unknown) =>
+          typeof block === 'object' && block !== null && 'text' in block
+            ? String(block.text)
+            : '',
+        )
+        .join(' ')
+        .trim()
+        .slice(0, 300)
+    : ''
+
+// The MCP server reads the .env of the folder its session starts in, so an
+// instance is worked on from a session of its own. Only the Claude desktop app
+// has the server that starts one; anywhere else the pane says where to go.
+const openSession = async ($: EngineInterface, one: Instance) => {
+  let refusal = ''
+  const started = await $.mcp
+    .call('ccd_session', 'start_session', {
+      initiation: 'user_asked',
+      title: `ServiceNow: ${one.name}`.slice(0, 58),
+      context: 'fresh',
+      cwd: one.folder,
+      use_worktree: false,
+      prompt:
+        'Call `sn_get_context` and tell me the instance, whether it is writable, and my current application and update set. Change nothing.',
+      background: `This session was opened from the ServiceNow instances pane to work on the instance at ${one.url}. Its credentials are in the .env of this folder, which the servicenow MCP server reads when the session starts. After reporting the context, wait for the developer's instructions.`,
+    })
+    .catch((error: unknown) => {
+      refusal = error instanceof Error ? error.message : String(error)
+
+      return undefined
+    })
+  if (started !== undefined && !started.isError) {
+    await say(
+      $,
+      `Opened a session for ${one.name}: look for "ServiceNow: ${one.name}" in the sidebar.`,
+    )
+
+    return
+  }
+  // The desktop app starts a session only on words the person sent themself: a
+  // plugin's call is refused outside a turn of theirs, and so is a prompt a
+  // plugin submits. So the request is written into the prompt box, theirs to
+  // send; the refusal is kept for whoever looks into it.
+  const why = (textOf(started?.content) || refusal).slice(0, 300)
+  await $.store.set('lastOpenRefusal', why === '' ? 'no reason given' : why)
+  const request = `Open a ServiceNow session for my instance "${one.name}": start a separate new session in the folder \`${one.folder}\`, titled "ServiceNow: ${one.name}". Its first task is to call \`sn_get_context\` and tell me the instance, whether it is writable, and my current application and update set, changing nothing, then wait for my instructions there.`
+  const draft = await $.prompt.read()
+  const filled = await $.prompt
+    .fill(
+      draft.text.trim() === ''
+        ? { text: request }
+        : { text: `\n\n${request}`, mode: 'append' },
+    )
+    .catch(() => undefined)
+  await say(
+    $,
+    filled?.isFilled === true
+      ? `The request to open ${one.name} is in the chat box: press Enter there to send it, and Claude opens the session.`
+      : `Could not open a session from here. Start a new session yourself in the folder ${one.folder}.`,
+  )
 }
 
 // What the person typed into the form. Kept here only: never in state, the
@@ -363,11 +601,10 @@ const save = async ($: EngineInterface) => {
     return say($, `Could not write to ${folder}. Check the folder for instances.`)
   }
 
-  await closeForm(
-    $,
-    `Created ${folder}. Start a new session in that folder to work on this instance.`,
-  )
+  await closeForm($, '')
   await refresh($)
+  await goTo($, 'list', name)
+  await say($, `Created ${folder}. Press Open session to work on this instance.`)
   await runCheck($, { name, folder, url, auth, user })
 }
 
@@ -439,7 +676,7 @@ export const register: Register = on => {
               key="save"
               label="Create folder and .env"
               variant="primary"
-              onPress={() => save($)}
+              onPress={() => later($, () => save($))}
             />
             <Text> </Text>
             <Button
@@ -452,96 +689,267 @@ export const register: Register = on => {
       )
     }
 
-    const list = await read($, instances)
+    const all = await read($, instances)
     const results = await read($, checks)
     const engine = await read($, server)
-
-    return (
-      <Box flexDirection="column">
-        {engine.text !== '' && (
+    const asked = await read($, confirm)
+    const where = await read($, nav)
+    const typed = await read($, query)
+    const message = now.message !== '' && <Text>{now.message}</Text>
+    const serverLine = engine.text !== '' && (
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={engine.status === 'installed' ? undefined : 'yellow'}
+        borderDimColor={engine.status === 'installed'}
+        paddingX={1}
+      >
+        <Text
+          dimColor={engine.status === 'installed'}
+          color={
+            engine.status === 'missing' ||
+            engine.status === 'no-python' ||
+            engine.status === 'needs-setup'
+              ? 'yellow'
+              : undefined
+          }
+        >
+          {engine.text}
+        </Text>
+        {engine.status === 'missing' && (
           <Box>
-            <Text
-              dimColor={engine.status === 'installed'}
-              color={
-                engine.status === 'missing' || engine.status === 'no-python'
-                  ? 'yellow'
-                  : undefined
-              }
-            >
-              {engine.text}{' '}
-            </Text>
-            {engine.status === 'missing' && (
-              <Button
-                key="install"
-                label="Install server"
-                variant="primary"
-                onPress={() => install($)}
-              />
-            )}
+            <Button
+              key="install"
+              label="Install server"
+              variant="primary"
+              onPress={() => later($, () => install($))}
+            />
           </Box>
         )}
-        <Input
-          key="base"
-          label="Folder for instances"
-          value={dir}
-          submitLabel="use"
-          onSubmit={async value => {
-            const next = value.trim()
-            if (next === '') return
-            await $.store.set('base', next)
-            await update($, base, () => next)
-            await refresh($)
-          }}
-        />
-        <Box>
+        {engine.status === 'needs-setup' && (
+          <Box>
+            <Button
+              key="finish-setup"
+              label="Finish setup"
+              variant="primary"
+              onPress={() => later($, () => finishSetup($))}
+            />
+          </Box>
+        )}
+      </Box>
+    )
+
+    if (where.screen === 'settings') {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Box>
+            <Button
+              key="back"
+              label="‹ All instances"
+              onPress={() => goTo($, 'list', '')}
+            />
+          </Box>
+          <Text bold>Settings</Text>
+          {serverLine}
+          <Box flexDirection="column">
+            <Input
+              key="base"
+              label="Folder for instances"
+              value={dir}
+              submitLabel="use"
+              onSubmit={value => {
+                const next = value.trim()
+                if (next !== '') later($, () => useBase($, next))
+              }}
+            />
+            <Text dimColor>
+              Each instance is a folder here that holds its own .env.
+            </Text>
+          </Box>
+          <Box>
+            <Button key="refresh" label="Check again" onPress={() => later($, () => refresh($))} />
+          </Box>
+          {message}
+        </Box>
+      )
+    }
+
+    const needle = typed.trim().toLowerCase()
+    const matching =
+      needle === ''
+        ? all
+        : all.filter(one =>
+            `${one.name} ${hostOf(one.url)}`.toLowerCase().includes(needle),
+          )
+    const shown = matching.slice(0, MAX_ROWS)
+    // A few instances show whole; a long list shows one line each, and the one
+    // pressed opens.
+    const isShort = shown.length <= OPEN_CARDS
+    const count =
+      matching.length === all.length
+        ? `${all.length} ${all.length === 1 ? 'instance' : 'instances'}`
+        : `${matching.length} of ${all.length} instances`
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {engine.status !== 'installed' && serverLine}
+        <Box gap={1} flexWrap="wrap">
           <Button
             key="add-basic"
-            label="Add instance"
+            label="+ Add instance"
             variant="primary"
             onPress={() => openForm($, 'basic')}
           />
-          <Text> </Text>
           <Button
             key="add-oauth"
-            label="Add with OAuth"
+            label="+ Add with OAuth"
             onPress={() => openForm($, 'oauth')}
           />
-          <Text> </Text>
-          <Button key="refresh" label="Refresh" onPress={() => refresh($)} />
+          {all.length > 0 && (
+            <Button
+              key="test-all"
+              label="Test all"
+              onPress={() => later($, () => testAll($, shown))}
+            />
+          )}
+          <Button key="refresh" label="Refresh" onPress={() => later($, () => refresh($))} />
+          <Button
+            key="settings"
+            label="Settings"
+            onPress={() => goTo($, 'settings', '')}
+          />
         </Box>
-        {now.message !== '' && <Text>{now.message}</Text>}
-        {list.length === 0 && (
-          <Text dimColor>No instance folders here yet.</Text>
+        {message}
+        {all.length > OPEN_CARDS && (
+          <Input
+            key="search"
+            label="Search"
+            placeholder="name or host"
+            value={typed}
+            submitLabel="filter"
+            onInput={value => update($, query, () => value)}
+            onSubmit={value => update($, query, () => value)}
+          />
         )}
-        {list.map(one => {
+        {all.length === 0 && (
+          <Text dimColor>
+            No instance folders in {dir} yet. Press Add instance to create the
+            first one.
+          </Text>
+        )}
+        {all.length > 0 && matching.length === 0 && (
+          <Text dimColor>No instance matches "{typed.trim()}".</Text>
+        )}
+        {shown.map(one => {
           const result = results[one.name]
+          const tag = tagOf(result)
+          const isOpen = isShort || where.name === one.name
+          const isAsking = asked === one.name
+          const chevron = isShort ? '' : isOpen ? '▾ ' : '▸ '
 
           return (
-            <Box flexDirection="column">
-              <Text> </Text>
-              <Box>
-                <Text bold>{one.name} </Text>
+            <Box
+              flexDirection="column"
+              borderStyle="round"
+              borderColor={isAsking ? 'yellow' : undefined}
+              borderDimColor={!isAsking}
+              paddingX={1}
+            >
+              <Box justifyContent="space-between" gap={1}>
                 <Button
-                  key={`test:${one.name}`}
-                  label="Test connection"
-                  onPress={() => runCheck($, one)}
-                />
-              </Box>
-              <Text dimColor>
-                {one.url} ({one.auth}, {one.user})
-              </Text>
-              <Text dimColor>{one.folder}</Text>
-              {result !== undefined && (
-                <Text
-                  dimColor={result.isRunning}
-                  color={result.isRunning ? undefined : result.ok ? 'green' : 'red'}
+                  key={`row:${one.name}`}
+                  plain
+                  onPress={() => toggle($, one.name)}
                 >
-                  {result.text}
-                </Text>
+                  {chevron}
+                  <Text color={colorOf(result)} dimColor={result === undefined}>
+                    {markOf(result)}
+                  </Text>{' '}
+                  <Text bold>{one.name}</Text>
+                  {'   '}
+                  <Text color={tagColorOf(tag)} dimColor={tagColorOf(tag) === undefined}>
+                    {tag}
+                  </Text>
+                  {isOpen ? '' : '   '}
+                  {!isOpen && <Text dimColor>{hostOf(one.url)}</Text>}
+                </Button>
+                {!isOpen && (
+                  <Button
+                    key={`open:${one.name}`}
+                    label="Open session"
+                    onPress={() => openSession($, one)}
+                  />
+                )}
+              </Box>
+              {isOpen && (
+                <Box flexDirection="column">
+                  <Text dimColor>
+                    {hostOf(one.url)} · {one.user} ·{' '}
+                    {one.auth === 'oauth' ? 'OAuth' : 'basic auth'}
+                  </Text>
+                  <Text dimColor>{one.folder}</Text>
+                  {result !== undefined && (
+                    <Text dimColor={result.isRunning} color={colorOf(result)}>
+                      {result.text}
+                    </Text>
+                  )}
+                  <Box gap={1} marginTop={1}>
+                    <Button
+                      key={`open:${one.name}`}
+                      label="Open session"
+                      variant="primary"
+                      onPress={() => openSession($, one)}
+                    />
+                    <Button
+                      key={`test:${one.name}`}
+                      label="Test connection"
+                      onPress={() => later($, () => runCheck($, one))}
+                    />
+                    {result?.allowHost !== undefined && !isAsking && (
+                      <Button
+                        key={`allow:${one.name}`}
+                        label="Allow writes"
+                        onPress={() => update($, confirm, () => one.name)}
+                      />
+                    )}
+                  </Box>
+                  {result?.allowHost !== undefined && isAsking && (
+                    <Box flexDirection="column" marginTop={1}>
+                      <Text color="yellow">
+                        Claude will be able to create and update records on{' '}
+                        {result.allowHost}. Only allow this on a development,
+                        test or sandbox instance, never production.
+                      </Text>
+                      <Box gap={1}>
+                        <Button
+                          key={`allow-yes:${one.name}`}
+                          label="It is not production: allow writes"
+                          onPress={() =>
+                            later($, () => allowWrites($, one, result.allowHost ?? ''))
+                          }
+                        />
+                        <Button
+                          key={`allow-no:${one.name}`}
+                          label="Cancel"
+                          onPress={() => update($, confirm, () => '')}
+                        />
+                      </Box>
+                    </Box>
+                  )}
+                </Box>
               )}
             </Box>
           )
         })}
+        {all.length > 0 && (
+          <Text dimColor>
+            {count}
+            {matching.length > shown.length
+              ? `, showing the first ${shown.length}: search to narrow the list`
+              : ''}
+            {isShort ? '.' : '. Press a name to open its card.'}
+          </Text>
+        )}
       </Box>
     )
   })
