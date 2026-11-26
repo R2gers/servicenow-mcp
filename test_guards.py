@@ -243,6 +243,14 @@ next_response[0] = FakeResponse(403, {"error": {"message": "Operation Failed", "
 msg = dispatch_error()
 check("403 includes ServiceNow message and detail",
       "403" in msg and "Operation Failed" in msg and "security constraints" in msg, msg)
+next_response[0] = FakeResponse(401, {"error": {"message": "User is not authenticated", "detail": "Required to provide Auth information"}})
+msg = dispatch_error()
+check("401 with basic auth suggests the API role and OAuth",
+      "Check the credentials" in msg and "snc_basic_auth_api_access" in msg and "OAuth" in msg, msg)
+srv.os.environ["SERVICENOW_AUTH_TYPE"] = "oauth"
+check("401 with OAuth does not suggest the basic auth role",
+      "snc_basic_auth_api_access" not in srv._error_message(next_response[0]), srv._error_message(next_response[0]))
+srv.os.environ["SERVICENOW_AUTH_TYPE"] = "basic"
 next_response[0] = FakeResponse(429, {"error": {"message": "Rate limit exceeded"}}, headers={"Retry-After": "60"})
 msg = dispatch_error()
 check("429 includes Retry-After", "429" in msg and "60" in msg, msg)
@@ -306,6 +314,41 @@ check("Unrelated hooks and allow rules are kept",
 check("Second run changes nothing", _apply_confirmation_rules(s)[1] == [])
 s, changes = _apply_confirmation_rules({})
 check("Works on empty settings", s == {"permissions": {"ask": ASK_RULES}})
+
+print("\n--- Setup: check and backup ---")
+import json as _json
+import tempfile as _tempfile
+from pathlib import Path as _Path
+import servicenow_mcp.setup as setup_mod
+
+_real_claude_dir = setup_mod._claude_dir
+with _tempfile.TemporaryDirectory() as _home:
+    _claude = _Path(_home) / ".claude"
+    setup_mod._claude_dir = lambda: _claude
+    state = setup_mod.check()
+    check("Check on an empty machine reports every gap, and writes nothing",
+          not state["ok"] and len(state["problems"]) == 3 and not _claude.exists(), str(state))
+
+    _claude.mkdir()
+    custom_hook = {"matcher": "mcp__servicenow__(sn_update_record|sn_create_record)",
+                   "hooks": [{"type": "prompt", "prompt": "my own review text"}]}
+    (_claude / "settings.json").write_text(_json.dumps({"model": "x", "hooks": {"PreToolUse": [custom_hook]}}), encoding="utf-8")
+    state = setup_mod.check()
+    check("Check names the old review hook", any("old review hook" in p for p in state["problems"]), str(state))
+    check("Check leaves settings.json as it was",
+          "my own review text" in (_claude / "settings.json").read_text(encoding="utf-8"))
+
+    setup_mod._install_confirmations()
+    setup_mod._install_skill()
+    (_Path(_home) / ".claude.json").write_text(_json.dumps({"mcpServers": {"servicenow": {}}}), encoding="utf-8")
+    after = _json.loads((_claude / "settings.json").read_text(encoding="utf-8"))
+    check("Setup replaces the old hook with ask rules and keeps other settings",
+          "hooks" not in after and after["permissions"]["ask"] == ASK_RULES and after["model"] == "x", str(after))
+    check("Setup keeps the previous settings in a backup file",
+          "my own review text" in (_claude / "settings.json.before-servicenow-mcp").read_text(encoding="utf-8"))
+    state = setup_mod.check()
+    check("Check passes once setup has run", state == {"ok": True, "problems": []}, str(state))
+setup_mod._claude_dir = _real_claude_dir
 
 print("\n--- Instance policy: decision ---")
 import asyncio

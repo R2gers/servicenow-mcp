@@ -502,6 +502,15 @@ _STATUS_HINTS = {
     429: "Rate limit reached on the instance. Wait before retrying.",
 }
 
+# Newer instances refuse basic auth on the API for a user who can sign in to the
+# UI with the very same password, and answer exactly as for a wrong password.
+_BASIC_AUTH_HINT = (
+    "If this username and password work in the browser, the instance is refusing basic auth for API calls. "
+    "Fix it in ServiceNow: open User Administration > Users, open this user, and add the role "
+    "snc_basic_auth_api_access in the Roles list. If that role does not exist, or multi-factor "
+    "authentication is required for the user, connect with OAuth instead."
+)
+
 
 def _error_message(resp) -> str:
     """Build a useful message from a failed ServiceNow response."""
@@ -519,6 +528,8 @@ def _error_message(resp) -> str:
     hint = _STATUS_HINTS.get(resp.status_code)
     if hint:
         parts.append(hint)
+    if resp.status_code == 401 and _auth_type() == "basic":
+        parts.append(_BASIC_AUTH_HINT)
     if resp.status_code == 429 and resp.headers.get("Retry-After"):
         parts.append(f"Retry-After: {resp.headers['Retry-After']}s")
     return " | ".join(parts)

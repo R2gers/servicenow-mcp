@@ -104,16 +104,65 @@ def _install_confirmations():
             print(f"  WARNING: {settings_file} has an unexpected shape; not touching it.")
             return
 
+    before = settings_file.read_text(encoding="utf-8") if settings_file.exists() else None
     settings, changes = _apply_confirmation_rules(settings)
     if not changes:
         print("  Confirmation rules already installed -- skipping")
         return
 
     settings_file.parent.mkdir(parents=True, exist_ok=True)
+    if before is not None:
+        # The removed hook may hold text the developer wrote: keep the file as it was.
+        backup = settings_file.with_name("settings.json.before-servicenow-mcp")
+        backup.write_text(before, encoding="utf-8")
+        print(f"  Previous settings kept -> {backup}")
     settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     for change in changes:
         print(f"  {change}")
     print(f"  Confirmation rules installed -> {settings_file}")
+
+
+def check() -> dict:
+    """Is this machine fully set up? Reads only; `servicenow-mcp-setup --check` prints it as JSON."""
+    import copy
+
+    problems: list[str] = []
+    settings_file = _claude_dir() / "settings.json"
+    settings: object = {}
+    if settings_file.exists():
+        try:
+            settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            settings = None
+            problems.append(f"{settings_file} could not be read, so write confirmations cannot be verified.")
+    if isinstance(settings, dict):
+        _, changes = _apply_confirmation_rules(copy.deepcopy(settings))
+        if any(change.startswith("removed legacy") for change in changes):
+            problems.append(
+                "An old review hook from an earlier version is still installed. A model evaluates it, "
+                "it is never shown to you, and it can refuse a write without saying why."
+            )
+        if any(change.startswith("ask before") for change in changes):
+            problems.append("Write confirmations are not installed: writes would run without asking you.")
+
+    skill_file = _claude_dir() / "skills" / SKILL_DIR_NAME / "SKILL.md"
+    try:
+        skill_current = skill_file.read_text(encoding="utf-8") == _load_skill_content()
+    except OSError:
+        skill_current = False
+    if not skill_current:
+        problems.append("The /servicenow skill is missing or out of date.")
+
+    registered = False
+    try:
+        config = json.loads((_claude_dir().parent / ".claude.json").read_text(encoding="utf-8"))
+        registered = MCP_KEY in (config.get("mcpServers") or {})
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not registered:
+        problems.append("The MCP server is not registered with Claude Code.")
+
+    return {"ok": not problems, "problems": problems}
 
 
 def _find_python() -> str:
@@ -339,6 +388,9 @@ def _allow_write_command(argv: list) -> int:
 def main():
     if "--allow-write" in sys.argv:
         sys.exit(_allow_write_command(sys.argv))
+    if "--check" in sys.argv:
+        print(json.dumps(check()))
+        sys.exit(0)
 
     quick = "--quick" in sys.argv
 

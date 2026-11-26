@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "servicenow-mcp"
-version = "0.3.1"
+version = "0.3.3"
 description = "ServiceNow MCP Server for Claude Code — query, update, and manipulate any ServiceNow instance with built-in safety guards."
 readme = "README.md"
 requires-python = ">=3.10"
